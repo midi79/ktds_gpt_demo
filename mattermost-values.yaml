@@ -1,0 +1,24 @@
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: nginx
+  hosts:
+    - mattermost.local
+  tls: []  # No TLS for local development
+
+service:
+  type: ClusterIP
+
+# Optional: Use NodePort if you're not using Ingress
+# service:
+#   type: NodePort
+#   nodePort: 30080
+
+minio:
+  enabled: true  # Enable internal object storage for testing
+
+postgresql:
+  enabled: true  # Enable internal PostgreSQL database for testing
+
+mattermostApp:
+  siteUrl: "http://mattermost.local"
