@@ -18,10 +18,7 @@ class MattermostBot:
                  backend_url, 
                  team_name=None, 
                  channel_name=None, 
-                 bot_username=None,
-                 # Add these parameters for alternative authentication
-                 username=None,
-                 password=None):
+                 bot_username=None):
         """
         Initialize the Mattermost bot with necessary configuration.
         
@@ -32,8 +29,6 @@ class MattermostBot:
             team_name: Optional team name to join
             channel_name: Optional channel name to join
             bot_username: Optional username of the bot account
-            username: Optional username for login authentication
-            password: Optional password for login authentication
         """
         self.mattermost_url = mattermost_url
         self.bot_token = bot_token
@@ -41,12 +36,11 @@ class MattermostBot:
         self.team_name = team_name
         self.channel_name = channel_name
         self.bot_username = bot_username
-        self.username = username
-        self.password = password
         self.driver = None
         self.event_handler = None
         self.running = False
         self.bot_user_id = None
+        self.websocket_thread = None
         
     def connect(self):
         """Connect to the Mattermost server and initialize the driver"""
@@ -70,39 +64,28 @@ class MattermostBot:
         port = parsed_url.port
         if not port:
             # Common Mattermost ports: 8065 (default), 443 (HTTPS), 80 (HTTP)
-            port = 443 if scheme == 'https' else 8065
+            port = 443 if scheme == 'https' else 31492
             
         logger.info(f"Connecting with scheme: {scheme}, hostname: {hostname}, port: {port}")
         
-        # Configure the Mattermost driver
+        # Configure the Mattermost driver with more flexible options
         driver_options = {
             'url': hostname,
+            'token': self.bot_token,
             'scheme': scheme,
             'port': port,
             'basepath': '/api/v4',
-            'verify': False,
-            'timeout': 30
+            'verify': False,  # Allow self-signed certificates for testing
+            'timeout': 30,    # Increase timeout
         }
         
-        # Add token if available
-        if self.bot_token:
-            driver_options['token'] = self.bot_token
-            
         logger.info(f"Driver configuration: {driver_options}")
         self.driver = Driver(driver_options)
         
         try:
-            # Try to login with token first
-            if self.bot_token:
-                logger.info("Attempting to login with token...")
-                self.driver.login()
-            # If username and password are provided, use them as fallback
-            elif self.username and self.password:
-                logger.info(f"Attempting to login with username: {self.username}")
-                self.driver.login(self.username, self.password)
-            else:
-                logger.error("No valid authentication method provided")
-                raise ValueError("Either token or username/password must be provided")
+            # Try to login 
+            logger.info("Attempting to login with token...")
+            self.driver.login()
             
             # Get the bot's user ID
             self.bot_user_id = self.driver.users.get_user('me')['id']
@@ -137,10 +120,30 @@ class MattermostBot:
             if team_id not in [team['id'] for team in my_teams]:
                 self.driver.teams.add_user_to_team(team_id, {'team_id': team_id, 'user_id': self.bot_user_id})
                 
-            # Get all channels in the team and find the specified channel
-            channels = self.driver.channels.get_channels_for_team(team_id)
-            channel_id = None
+            # Get all channels in the team
+            logger.info(f"Getting channels for team ID: {team_id}")
+            try:
+                # Try the method that might exist in newer versions
+                channels = self.driver.channels.get_channels_for_team(team_id)
+            except AttributeError:
+                # Fallback for older versions
+                logger.info("Falling back to get_public_channels method")
+                try:
+                    channels = self.driver.channels.get_public_channels(team_id)
+                except AttributeError:
+                    # Another fallback - list team channels
+                    logger.info("Falling back to get_team_channels")
+                    channels = []
+                    try:
+                        channels = self.driver.channels.get_team_channels(team_id)
+                    except AttributeError:
+                        logger.error("Could not find a method to list channels")
+                        # Just continue with empty channels list
+                
+            logger.info(f"Found {len(channels)} channels")
             
+            channel_id = None
+            # Search for the channel by name
             for channel in channels:
                 if channel['name'] == self.channel_name:
                     channel_id = channel['id']
@@ -148,17 +151,88 @@ class MattermostBot:
                     
             if not channel_id:
                 logger.error(f"Channel '{self.channel_name}' not found in team '{self.team_name}'")
+                # Let's list available channels to help the user
+                logger.info("Available channels:")
+                for channel in channels:
+                    logger.info(f" - {channel['name']} (ID: {channel['id']})")
                 return
                 
-            # Join the channel if not already a member
-            my_channels = self.driver.channels.get_channels_for_user(self.bot_user_id, team_id)
-            if channel_id not in [channel['id'] for channel in my_channels]:
+            # Join the channel
+            logger.info(f"Attempting to join channel {channel_id}")
+            
+            # Try multiple methods to join the channel
+            joined = False
+            
+            # Method 1: add_channel_member
+            try:
                 self.driver.channels.add_channel_member(channel_id, {'user_id': self.bot_user_id})
-                
-            logger.info(f"Successfully joined team '{self.team_name}' and channel '{self.channel_name}'")
+                joined = True
+                logger.info("Joined channel using add_channel_member")
+            except AttributeError:
+                logger.info("add_channel_member not available, trying alternative methods")
+            
+            # Method 2: add_user
+            if not joined:
+                try:
+                    self.driver.channels.add_user(channel_id, {'user_id': self.bot_user_id})
+                    joined = True
+                    logger.info("Joined channel using add_user")
+                except (AttributeError, Exception) as e:
+                    logger.info(f"add_user method failed: {str(e)}")
+            
+            # Method 3: Direct API call using the base driver
+            if not joined:
+                try:
+                    endpoint = f'/channels/{channel_id}/members'
+                    self.driver.client.make_request('post', endpoint, options={'user_id': self.bot_user_id})
+                    joined = True
+                    logger.info("Joined channel using direct API call")
+                except Exception as e:
+                    logger.info(f"Direct API call failed: {str(e)}")
+            
+            # Check if already a member
+            if not joined:
+                try:
+                    # Check if already a member - this might throw an error if not a member
+                    member = self.driver.channels.get_channel_member(channel_id, self.bot_user_id)
+                    logger.info("Already a member of the channel")
+                    joined = True
+                except Exception as e:
+                    if "not a member" in str(e).lower():
+                        logger.error("Failed to join channel and not already a member")
+                    else:
+                        logger.error(f"Error checking channel membership: {str(e)}")
+            
+            if joined:
+                logger.info(f"Successfully joined team '{self.team_name}' and channel '{self.channel_name}'")
+            else:
+                logger.error("Could not join channel with any available method")
             
         except Exception as e:
             logger.error(f"Error joining team and channel: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def _init_websocket_in_thread(self):
+        """Initialize the WebSocket connection in a separate thread"""
+        # Create a new event loop for the thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # Initialize the WebSocket connection
+            self.driver.init_websocket(self._handle_websocket_event)
+            
+            # Run the event loop until self.running is False
+            while self.running:
+                loop.run_until_complete(asyncio.sleep(1))
+                
+        except Exception as e:
+            logger.error(f"WebSocket thread error: {str(e)}")
+        finally:
+            # Clean up the event loop
+            loop.close()
+            logger.info("WebSocket thread has ended")
     
     def start(self):
         """Start the bot and listen for events"""
@@ -169,8 +243,10 @@ class MattermostBot:
         self.running = True
         logger.info("Starting Mattermost bot")
         
-        # Connect to WebSocket for real-time events
-        self.driver.init_websocket(self._handle_websocket_event)
+        # Start WebSocket in a separate thread
+        self.websocket_thread = threading.Thread(target=self._init_websocket_in_thread)
+        self.websocket_thread.daemon = True
+        self.websocket_thread.start()
         
         # Keep the main thread running
         try:
@@ -192,6 +268,10 @@ class MattermostBot:
             except Exception as e:
                 logger.error(f"Error during disconnection: {str(e)}")
             self.driver = None
+            
+        # Wait for the WebSocket thread to finish
+        if self.websocket_thread and self.websocket_thread.is_alive():
+            self.websocket_thread.join(timeout=5)
             
     def _handle_websocket_event(self, event):
         """
