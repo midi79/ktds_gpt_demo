@@ -23,6 +23,4 @@ helm show values mattermost/mattermost-team-edition > values.yaml
 
 kubectl config set-context --current --namespace=mattermost
 
-helm install mattermost mattermost/mattermost-team-edition \
-  --namespace mattermost \
-  --values values.yaml
+helm install mattermost mattermost/mattermost-team-edition --namespace mattermost -f values.yaml
