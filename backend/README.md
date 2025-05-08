@@ -1,3 +1,5 @@
+## backend 폴더에 있는 소스는 사용하지 않는 소스입니다.
+
 
 1. env setting<br>
 python -m venv chatbot
