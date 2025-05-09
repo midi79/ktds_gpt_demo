@@ -43,8 +43,11 @@ uvicorn main:app --reload --port 8999
 <br>
 
 ## 사용법
-채널에서 "/gpt help"를 치면 사전에 지정된 답변이 도출된다. <br>
+- 채널에서 "/gpt help"를 치면 사전에 지정된 답변이 도출된다. <br>
 "/gpt 한국의 사계절에 대해 알려줘" <br>
 이런식의 문장은 사전 등록이 안되어 있기에 GPT로 전달되고 GPT에 의해 생성된 답변을 받을 수 있다.
 
+- Prometheus PromQL 실행
+  /gpt metric [PromQL] <br>
+  예) /gpt metric kube_pod_info <br>
 

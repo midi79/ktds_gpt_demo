@@ -27,6 +27,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MATTERMOST_URL = os.getenv("MATTERMOST_URL")
 MATTERMOST_BOT_TOKEN = os.getenv("MATTERMOST_BOT_TOKEN")
 MATTERMOST_WEBHOOK_TOKEN = os.getenv("MATTERMOST_WEBHOOK_TOKEN")  # For verification
+PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://localhost:9090")  # Prometheus API URL
 
 # Response model for Mattermost
 class MattermostResponse(BaseModel):
@@ -48,6 +49,7 @@ Available commands:
 - help: Show this help message
 - ping: Check if the bot is online
 - status: Get system status
+- metric [query]: Execute a PromQL query against Prometheus
 - any other text: Will be processed by ChatGPT
 """
         elif clean_command.startswith("ping"):
@@ -57,6 +59,85 @@ Available commands:
             
         # If no predefined command matches, return None so it can be processed by ChatGPT
         return None
+
+# Service for Prometheus integration
+class PrometheusService:
+    @staticmethod
+    async def execute_query(query: str) -> str:
+        """Execute a PromQL query against Prometheus and return the results."""
+        if not PROMETHEUS_URL:
+            return "Error: Prometheus URL is not configured. Please contact the administrator."
+            
+        logger.info(f"Executing PromQL query: {query}")
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{PROMETHEUS_URL}/api/v1/query",
+                    params={"query": query},
+                    timeout=10.0
+                )
+                
+                response.raise_for_status()
+                data = response.json()
+                
+                if data["status"] == "success":
+                    result_type = data["data"]["resultType"]
+                    results = data["data"]["result"]
+                    
+                    if not results:
+                        return "The query returned no results."
+                    
+                    if result_type == "vector":
+                        formatted_results = "### Prometheus Query Results\n\n"
+                        formatted_results += f"Query: `{query}`\n\n"
+                        
+                        for i, result in enumerate(results, 1):
+                            # Format labels
+                            labels = result.get("metric", {})
+                            label_str = ", ".join([f"{k}={v}" for k, v in labels.items()])
+                            
+                            # Format value
+                            value = result.get("value", [])
+                            if len(value) >= 2:
+                                timestamp, metric_value = value
+                                # Try to make the value more readable
+                                try:
+                                    # Convert scientific notation to readable format if needed
+                                    metric_value = float(metric_value)
+                                    if abs(metric_value) < 0.001 or abs(metric_value) > 100000:
+                                        formatted_value = f"{metric_value:.6e}"
+                                    else:
+                                        formatted_value = f"{metric_value:.6f}".rstrip('0').rstrip('.')
+                                except ValueError:
+                                    formatted_value = str(metric_value)
+                                
+                                formatted_results += f"**Result {i}:** {label_str}\n"
+                                formatted_results += f"**Value:** {formatted_value}\n\n"
+                    elif result_type == "matrix":
+                        formatted_results = "### Prometheus Range Query Results\n\n"
+                        formatted_results += f"Query: `{query}`\n\n"
+                        formatted_results += "Results are in matrix format. Please use a specific instant query for more readable results."
+                    else:
+                        formatted_results = f"### Prometheus Results ({result_type})\n\n"
+                        formatted_results += f"Query: `{query}`\n\n"
+                        formatted_results += f"```\n{results}\n```"
+                    
+                    return formatted_results
+                else:
+                    return f"Error executing query: {data.get('error', 'Unknown error')}"
+                    
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error from Prometheus API: {e.response.status_code}")
+            return f"Sorry, there was an issue with the Prometheus service (HTTP {e.response.status_code}). Please try again later."
+            
+        except httpx.RequestError as e:
+            logger.error(f"Request error connecting to Prometheus: {str(e)}")
+            return "Sorry, I couldn't connect to the Prometheus service. Please check if it's running and accessible."
+            
+        except Exception as e:
+            logger.error(f"Unexpected error with Prometheus: {str(e)}")
+            return f"Sorry, an unexpected error occurred: {str(e)}"
 
 # Service for ChatGPT integration
 class ChatGPTService:
@@ -183,6 +264,25 @@ async def mattermost_webhook(
     
     logger.info(f"Received slash command: {command} with text: {text} from user: {user_name}")
     
+    # Check if this is a Prometheus metrics request
+    if "metric" in text.lower():
+        # Extract the PromQL query from the text
+        # Assuming format is "metric <promql-query>"
+        parts = text.split(" ", 1)
+        if len(parts) > 1:
+            query = parts[1].strip()
+            # Use a background task for potentially slow Prometheus queries
+            asyncio.create_task(process_prometheus_query(query, channel_id, user_name, response_url))
+            return MattermostResponse(
+                text="Processing your Prometheus query... I'll respond shortly.",
+                response_type="ephemeral"  # Only visible to the requesting user
+            )
+        else:
+            return MattermostResponse(
+                text="Please provide a PromQL query after 'metric'. Example: metric up",
+                response_type="ephemeral"
+            )
+    
     # First send an immediate response to acknowledge receipt
     # This prevents Mattermost from timing out (it expects a response within 3000ms)
     if text.lower() != "help" and text.lower() != "ping" and text.lower() != "status":
@@ -205,6 +305,50 @@ async def mattermost_webhook(
     
     # Return the response directly to Mattermost
     return MattermostResponse(text=response)
+
+async def process_prometheus_query(query: str, channel_id: str, user_name: str, response_url: str):
+    """Process a Prometheus query in the background and send response when ready."""
+    try:
+        # Get response from Prometheus
+        prometheus_service = PrometheusService()
+        response = await prometheus_service.execute_query(query)
+        
+        # Format response
+        formatted_response = f"@{user_name} requested metrics: \"{query}\"\n\n{response}"
+        
+        # Send response back to Mattermost
+        if response_url:
+            # Use the response_url if available (preferred method)
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    response_url,
+                    json={"text": formatted_response, "response_type": "in_channel"},
+                    timeout=10.0
+                )
+        else:
+            # Fall back to using the Mattermost API
+            mattermost_service = MattermostService()
+            await mattermost_service.send_response(channel_id, formatted_response)
+            
+    except Exception as e:
+        logger.error(f"Error in Prometheus query processing: {str(e)}")
+        # Send error message
+        try:
+            if response_url:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        response_url,
+                        json={"text": f"Sorry, I encountered an error with your Prometheus query: {str(e)}", "response_type": "ephemeral"},
+                        timeout=10.0
+                    )
+            else:
+                mattermost_service = MattermostService()
+                await mattermost_service.send_response(
+                    channel_id, 
+                    f"@{user_name} I encountered an error processing your Prometheus query: {str(e)}"
+                )
+        except Exception as inner_e:
+            logger.error(f"Failed to send error message: {str(inner_e)}")
 
 async def process_and_respond_later(text: str, channel_id: str, user_name: str, response_url: str):
     """Process a request in the background and send response when ready."""
