@@ -1,0 +1,101 @@
+prometheus:
+  enabled: true
+  ingress:
+    enabled: true
+    ingressClassName: nginx # Or your specific nginx ingress class name
+    annotations:
+      # Optional: Add any specific nginx annotations you need
+      # kubernetes.io/ingress.class: nginx
+      # nginx.ingress.kubernetes.io/rewrite-target: /
+    hosts:
+      - prometheus.local # Replace with your desired hostname
+    paths:
+      - /
+    # Optional: If you have TLS configured for your ingress
+    # tls:
+    #   - secretName: prometheus-tls-secret # Replace with your TLS secret name
+    #     hosts:
+    #       - prometheus.local
+  
+    persistence:
+     enabled: true
+     size: 20Gi
+  #   type: sts
+  #   storageClassName: "storageClassName"
+  #   accessModes:
+  #     - ReadWriteOnce
+       
+  # Configure persistence for Prometheus (highly recommended)
+  # prometheusSpec:
+  #   storageSpec:
+  #     volumeClaimTemplate:
+  #       spec:
+  #         storageClassName: default # Or your specific storage class
+  #         accessModes: ["ReadWriteOnce"]
+  #         resources:
+  #           requests:
+  #             storage: 10Gi # Adjust size as needed
+  #   retention: 15d # Adjust retention as needed
+
+grafana:
+  enabled: true
+  adminUser: admin
+  adminPassword: New1234!
+  ingress:
+    enabled: true
+    ingressClassName: nginx # Or your specific nginx ingress class name
+    annotations:
+      # Optional: Add any specific nginx annotations you need
+      # kubernetes.io/ingress.class: nginx
+      # nginx.ingress.kubernetes.io/rewrite-target: /
+      # nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    hosts:
+      - grafana.local # Replace with your desired hostname
+    paths:
+      - /
+    # Optional: If you have TLS configured for your ingress
+    # tls:
+    #   - secretName: grafana-tls-secret # Replace with your TLS secret name
+    #     hosts:
+    #       - grafana.local
+  # Persist Grafana dashboards and settings (recommended for local K8s)
+  persistence:
+    enabled: true
+    # type: pvc
+    # storageClassName: default # Or your specific storage class
+    # accessModes:
+    #   - ReadWriteOnce
+    # size: 10Gi
+
+alertmanager:
+  enabled: true
+  ingress:
+    enabled: true
+    ingressClassName: nginx # Or your specific nginx ingress class name
+    annotations:
+      # Optional: Add any specific nginx annotations you need
+      # kubernetes.io/ingress.class: nginx
+      # nginx.ingress.kubernetes.io/rewrite-target: /
+    hosts:
+      - alertmanager.local # Replace with your desired hostname
+    paths:
+      - /
+    # Optional: If you have TLS configured for your ingress
+    # tls:
+    #   - secretName: alertmanager-tls-secret # Replace with your TLS secret name
+    #     hosts:
+    #       - alertmanager.local
+  # Optional: Configure persistence for Alertmanager if needed
+  # alertmanagerSpec:
+  #   storage:
+  #     volumeClaimTemplate:
+  #       spec:
+  #         storageClassName: default # Or your specific storage class
+  #         accessModes: ["ReadWriteOnce"]
+  #         resources:
+  #           requests:
+  #             storage: 10Gi
+
+prometheus-node-exporter:
+  hostRootFsMount:
+    enabled: false

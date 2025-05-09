@@ -34,7 +34,7 @@ pip install -r requirements.txt
 cd mattermost-bot<br>
 uvicorn main:app --reload --port 8999
 
-2. ngrok 실행
+2. 다른 터미널창에서 ngrok 실행
 - ngrok http 8999
 - Forwarding URL을 Mattermost Slash Commands의 Request URL에 셋팅<br>
   ex) https://bb38-121-138-201-117.ngrok-free.app/webhook
