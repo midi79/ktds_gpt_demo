@@ -50,6 +50,7 @@ Available commands:
 - ping: Check if the bot is online
 - status: Get system status
 - metric [query]: Execute a PromQL query against Prometheus
+- query [natural language]: Generate a PromQL query from natural language and execute it
 - any other text: Will be processed by ChatGPT
 """
         elif clean_command.startswith("ping"):
@@ -146,7 +147,7 @@ class ChatGPTService:
     max_retries = 3
     
     @staticmethod
-    async def get_response(message: str) -> str:
+    async def get_response(message: str, system_prompt: str = None) -> str:
         """Get response from ChatGPT with retry logic and rate limiting."""
         if not OPENAI_API_KEY:
             return "Error: OpenAI API key is not configured. Please contact the administrator."
@@ -161,6 +162,10 @@ class ChatGPTService:
             logger.warning("Rate limit preemptively applied")
             ChatGPTService.request_count = max(0, ChatGPTService.request_count - 5)  # Decay mechanism
             return "I'm getting too many requests right now. Please try again in a few moments."
+        
+        # Default system prompt if none provided
+        if system_prompt is None:
+            system_prompt = "You are a helpful assistant integrated with Mattermost. Keep responses concise and under 2000 characters."
         
         # Implement retry with exponential backoff
         retry_delay = 1  # Starting delay in seconds
@@ -177,7 +182,7 @@ class ChatGPTService:
                         json={
                             "model": "gpt-4o-mini",  # Using a more available model as backup
                             "messages": [
-                                {"role": "system", "content": "You are a helpful assistant integrated with Mattermost. Keep responses concise and under 2000 characters."},
+                                {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": message}
                             ],
                             "temperature": 0.7,
@@ -189,6 +194,7 @@ class ChatGPTService:
                     # If we get here, the request succeeded
                     response.raise_for_status()
                     data = response.json()
+                    logger.info(f"Message from ChatGPT: {data}")
                     return data["choices"][0]["message"]["content"]
                     
             except httpx.HTTPStatusError as e:
@@ -212,6 +218,49 @@ class ChatGPTService:
             except Exception as e:
                 logger.error(f"Unexpected error with ChatGPT: {str(e)}")
                 return "Sorry, an unexpected error occurred. Please try again with a simpler question."
+
+    @staticmethod
+    async def generate_promql(natural_language_query: str) -> str:
+        """Generate a PromQL query from natural language using ChatGPT."""
+        system_prompt = """You are a Prometheus expert. Convert natural language monitoring queries into valid PromQL.
+        
+Your response should ONLY contain the PromQL query, nothing else - no explanations, no markdown formatting.
+Make sure the query is valid PromQL syntax that would work in Prometheus.
+If you don't know how to convert the query, respond with 'up' which is a simple validation query.
+        
+Examples:
+- User: "Show me CPU usage across all nodes"
+- Response: sum by (instance) (rate(node_cpu_seconds_total{mode!="idle"}[5m])) / sum by (instance) (rate(node_cpu_seconds_total[5m])) * 100
+        
+- User: "How many HTTP errors in the last hour?"
+- Response: sum(increase(http_requests_total{status=~"5.."}[1h]))
+        
+- User: "Memory usage by pod in the production namespace"
+- Response: sum by (pod) (container_memory_usage_bytes{namespace="production"})
+        """
+        
+        # Call ChatGPT to generate PromQL
+        promql = await ChatGPTService.get_response(natural_language_query, system_prompt)
+        
+        # Clean up the response - remove any markdown code blocks, explanations, etc.
+        promql = promql.strip('`')
+        if promql.startswith('```promql'):
+            promql = promql[8:]
+        if promql.startswith('```'):
+            promql = promql[3:]
+        
+        # Remove any trailing markdown
+        if promql.endswith('```'):
+            promql = promql[:-3]
+            
+        # Final cleanup
+        promql = promql.strip()
+        
+        # If it's empty or if it's clear we got an error/explanation instead of PromQL
+        if not promql or len(promql.split('\n')) > 3 or 'sorry' in promql.lower():
+            return "up"  # Default to a simple working query
+            
+        return promql
 
 # Service for sending messages back to Mattermost
 class MattermostService:
@@ -264,10 +313,9 @@ async def mattermost_webhook(
     
     logger.info(f"Received slash command: {command} with text: {text} from user: {user_name}")
     
-    # Check if this is a Prometheus metrics request
-    if "metric" in text.lower():
+    # Check if this is a direct Prometheus metrics query
+    if text.lower().startswith("metric "):
         # Extract the PromQL query from the text
-        # Assuming format is "metric <promql-query>"
         parts = text.split(" ", 1)
         if len(parts) > 1:
             query = parts[1].strip()
@@ -283,28 +331,91 @@ async def mattermost_webhook(
                 response_type="ephemeral"
             )
     
-    # First send an immediate response to acknowledge receipt
-    # This prevents Mattermost from timing out (it expects a response within 3000ms)
-    if text.lower() != "help" and text.lower() != "ping" and text.lower() != "status":
-        # For longer queries that might take time, acknowledge receipt immediately
-        # We'll use a background task to send the actual response
-        asyncio.create_task(process_and_respond_later(text, channel_id, user_name, response_url))
-        return MattermostResponse(
-            text="Processing your request... I'll respond shortly.",
-            response_type="ephemeral"  # Only visible to the requesting user
-        )
+    # Check if this is a natural language to PromQL query request
+    elif text.lower().startswith("query "):
+        # Extract the natural language query
+        parts = text.split(" ", 1)
+        if len(parts) > 1:
+            natural_language_query = parts[1].strip()
+            # Process natural language query in the background
+            asyncio.create_task(process_natural_language_to_promql(natural_language_query, channel_id, user_name, response_url))
+            return MattermostResponse(
+                text="Generating PromQL from your query... I'll respond shortly.",
+                response_type="ephemeral"  # Only visible to the requesting user
+            )
+        else:
+            return MattermostResponse(
+                text="Please provide a natural language query after 'query'. Example: query show me CPU usage",
+                response_type="ephemeral"
+            )
     
     # For quick commands, process immediately
     command_service = CommandService()
     response = command_service.process_command(text)
     
-    # If it's a quick command that wasn't matched, use ChatGPT
-    if response is None:
-        chatgpt_service = ChatGPTService()
-        response = await chatgpt_service.get_response(text)
+    if response is not None:
+        # It's a predefined command with an immediate response
+        return MattermostResponse(text=response)
     
-    # Return the response directly to Mattermost
-    return MattermostResponse(text=response)
+    # For any other text, process with ChatGPT in the background
+    asyncio.create_task(process_and_respond_later(text, channel_id, user_name, response_url))
+    return MattermostResponse(
+        text="Processing your request... I'll respond shortly.",
+        response_type="ephemeral"  # Only visible to the requesting user
+    )
+
+async def process_natural_language_to_promql(query: str, channel_id: str, user_name: str, response_url: str):
+    """Process natural language, generate PromQL, execute it, and return results."""
+    try:
+        # Get PromQL from ChatGPT
+        chatgpt_service = ChatGPTService()
+        promql = await chatgpt_service.generate_promql(query)
+        
+        # Log the generated PromQL
+        logger.info(f"Generated PromQL: {promql}")
+        
+        # Execute the PromQL query against Prometheus
+        prometheus_service = PrometheusService()
+        results = await prometheus_service.execute_query(promql)
+        
+        # Format the complete response
+        formatted_response = (
+            f"@{user_name} asked: \"{query}\"\n\n"
+            f"**Generated PromQL:** `{promql}`\n\n"
+            f"{results}"
+        )
+        
+        # Send response back to Mattermost
+        if response_url:
+            # Use the response_url if available
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    response_url,
+                    json={"text": formatted_response, "response_type": "in_channel"},
+                    timeout=10.0
+                )
+        else:
+            # Fall back to using the Mattermost API
+            mattermost_service = MattermostService()
+            await mattermost_service.send_response(channel_id, formatted_response)
+            
+    except Exception as e:
+        logger.error(f"Error in natural language to PromQL processing: {str(e)}")
+        # Send error message
+        error_message = f"Sorry, I encountered an error processing your natural language query: {str(e)}"
+        try:
+            if response_url:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        response_url,
+                        json={"text": error_message, "response_type": "ephemeral"},
+                        timeout=10.0
+                    )
+            else:
+                mattermost_service = MattermostService()
+                await mattermost_service.send_response(channel_id, f"@{user_name} {error_message}")
+        except Exception as inner_e:
+            logger.error(f"Failed to send error message: {str(inner_e)}")
 
 async def process_prometheus_query(query: str, channel_id: str, user_name: str, response_url: str):
     """Process a Prometheus query in the background and send response when ready."""
