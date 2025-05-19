@@ -25,7 +25,9 @@ https://platform.openai.com/
    VS Code 가상환경 셋팅 방법 참조 (KTDS_GPT_DEMO 폴더 상에서 설정)<br>
    https://www.ecopro.ai/entry/Visual-Studio-Code-%ED%8C%8C%EC%9D%B4%EC%8D%ACPython-%EA%B0%80%EC%83%81%EA%B0%9C%EB%B0%9C%ED%99%98%EA%B2%BDvenv-%EC%84%A4%EC%A0%95
 
-2. 라이브러리 설치
+2. ktds_gpt_demo 폴더에서 .venv\Scripts\activate 명령어로 가상환경 활성화
+
+3. 라이브러리 설치
 pip install -r requirements.txt
 <br>
 

@@ -14,6 +14,10 @@ import json
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 import yaml
+import subprocess
+import shlex
+import re
+from typing import Optional
 
 # Load environment variables from .env file
 load_dotenv()
@@ -40,56 +44,121 @@ class MattermostResponse(BaseModel):
     text: str
     response_type: str = "in_channel"
 
-# Initialize Kubernetes client
+# Kubernetes Service - Complete Implementation
 class KubernetesService:
     def __init__(self):
-        """Initialize Kubernetes client."""
+        """Initialize Kubernetes client with proper error handling."""
+        # Initialize all attributes first
+        self.v1 = None
+        self.apps_v1 = None
+        self.client_initialized = False
+        
+        # Security: Define allowed kubectl commands to prevent command injection
+        self.allowed_kubectl_commands = {
+            'get', 'describe', 'logs', 'cluster-info', 'version', 
+            'config', 'api-resources', 'api-versions', 'top'
+        }
+        
+        # Enable/disable subprocess execution (set to False by default for security)
+        self.enable_subprocess = os.getenv("ENABLE_KUBECTL_SUBPROCESS", "false").lower() == "true"
+        
+        # Path to kubectl binary (should be in PATH or specify full path)
+        self.kubectl_path = os.getenv("KUBECTL_PATH", "kubectl")
+        
+        # Try to initialize Kubernetes client
+        self._initialize_kubernetes_client()
+    
+    def _initialize_kubernetes_client(self):
+        """Initialize Kubernetes client with multiple fallback strategies."""
         try:
-            # Try to load in-cluster config first
+            # Strategy 1: Try to load in-cluster config first
             try:
                 config.load_incluster_config()
                 logger.info("Loaded in-cluster Kubernetes configuration")
+                self._setup_api_clients()
+                return
             except config.ConfigException:
-                # Fall back to kubeconfig file
-                if KUBERNETES_CONFIG_PATH:
-                    config.load_kube_config(config_file=KUBERNETES_CONFIG_PATH)
-                else:
-                    config.load_kube_config()
-                logger.info("Loaded Kubernetes configuration from file")
+                logger.info("In-cluster config not available")
+                pass
             
-            self.v1 = client.CoreV1Api()
-            self.apps_v1 = client.AppsV1Api()
-            self.networking_v1 = client.NetworkingV1Api()
-            self.batch_v1 = client.BatchV1Api()
-            self.storage_v1 = client.StorageV1Api()
+            # Strategy 2: Try custom kubeconfig path if specified
+            if KUBERNETES_CONFIG_PATH and os.path.exists(KUBERNETES_CONFIG_PATH):
+                try:
+                    config.load_kube_config(config_file=KUBERNETES_CONFIG_PATH)
+                    logger.info(f"Loaded Kubernetes configuration from: {KUBERNETES_CONFIG_PATH}")
+                    self._setup_api_clients()
+                    return
+                except Exception as e:
+                    logger.warning(f"Custom kubeconfig failed: {e}")
+                    pass
+            
+            # Strategy 3: Try default kubeconfig
+            try:
+                config.load_kube_config()
+                logger.info("Loaded default Kubernetes configuration")
+                self._setup_api_clients()
+                return
+            except Exception as e:
+                logger.warning(f"Default kubeconfig failed: {e}")
+                pass
+            
+            # If all strategies fail
+            logger.error("Failed to initialize Kubernetes client with any method")
+            logger.info("Kubernetes operations will fall back to subprocess if enabled")
             
         except Exception as e:
-            logger.error(f"Failed to initialize Kubernetes client: {str(e)}")
+            logger.error(f"Unexpected error during Kubernetes client initialization: {str(e)}")
+    
+    def _setup_api_clients(self):
+        """Setup API clients after successful configuration loading."""
+        try:
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            self.client_initialized = True
+            logger.info("Kubernetes API clients initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to setup API clients: {str(e)}")
             self.v1 = None
-            
+            self.client_initialized = False
+    
+    def is_client_available(self) -> bool:
+        """Check if Kubernetes client is properly initialized."""
+        return self.client_initialized and self.v1 is not None
+    
     async def execute_kubectl_command(self, command: str, format_type: str = "yaml") -> str:
-        """
-        Execute kubectl-like commands using the Kubernetes Python client.
-        """
-        if not self.v1:
-            return "Error: Kubernetes client is not initialized. Please check your configuration."
-            
+        """Execute kubectl-like commands using the Kubernetes Python client or subprocess fallback."""
+        # Check if client is available
+        if not self.is_client_available():
+            if self.enable_subprocess:
+                logger.info("Kubernetes client not available, using subprocess fallback")
+                return await self._execute_kubectl_via_subprocess(command, format_type)
+            else:
+                return self._get_client_unavailable_message()
+        
         try:
             # Store original command for reference
             original_command = command.strip()
             
-            # Use lowercase version ONLY for command detection, not for actual processing
+            # Use lowercase version ONLY for command detection
             command_lower = command.strip().lower()
             parts = command_lower.split()
             
             if not parts:
                 return "Error: Empty command"
             
+            # Remove 'kubectl' from the beginning if present
+            if parts[0] == "kubectl":
+                parts = parts[1:]
+                command_lower = " ".join(parts)
+            
+            if not parts:
+                return "Error: No command specified after 'kubectl'"
+            
             # Parse the main command structure
             verb = parts[0] if parts else ""
             resource = parts[1] if len(parts) > 1 else ""
             
-            # Handle various get commands - PASS ORIGINAL COMMAND
+            # Try Python client first for supported commands
             if verb == "get":
                 if resource in ["pods", "pod"]:
                     return await self._get_pods(original_command, format_type)
@@ -102,364 +171,159 @@ class KubernetesService:
                 elif resource in ["nodes", "node"]:
                     return await self._get_nodes(original_command, format_type)
             
-            # Handle describe commands - PASS ORIGINAL COMMAND
             elif verb == "describe":
                 if resource in ["pod", "pods"]:
                     return await self._describe_pod(original_command, format_type)
-                else:
-                    return await self._execute_unsupported_command(original_command)
             
-            # Handle logs commands - PASS ORIGINAL COMMAND
-            elif verb == "logs" or (verb == "get" and resource == "logs"):
+            elif verb == "logs":
                 return await self._get_logs(original_command, format_type)
             
-            # Try to interpret the command more flexibly - PASS ORIGINAL COMMAND
-            elif "describe pod" in command_lower:
-                return await self._describe_pod(original_command, format_type)
-            
-            # Try to interpret the command more flexibly first
-            elif "get pods" in command:
-                return await self._get_pods(command, format_type)
-            elif "get services" in command or "get svc" in command:
-                return await self._get_services(command, format_type)
-            elif "get deployments" in command or "get deploy" in command:
-                return await self._get_deployments(command, format_type)
-            elif "get namespaces" in command or "get ns" in command:
-                return await self._get_namespaces(command, format_type)
-            elif "get nodes" in command:
-                return await self._get_nodes(command, format_type)
-            elif "describe pod" in command:
-                return await self._describe_pod(command, format_type)
-            elif "logs" in command:
-                return await self._get_logs(command, format_type)
-            
-            # NEW: Handle unsupported commands instead of returning error immediately
-            # Special handling for common unsupported commands
-            if verb == "cluster-info":
-                return await self._get_cluster_info()
-            elif verb == "version":
-                return await self._get_version()
-            elif verb == "config":
-                return await self._handle_config_command(original_command)
-            elif "api-resources" in command:
-                return await self._get_api_resources()
-            elif "api-versions" in command:
-                return await self._get_api_versions()
+            # For commands not supported by Python client, try subprocess
+            if self.enable_subprocess:
+                return await self._execute_kubectl_via_subprocess(original_command, format_type)
             else:
-                # For any other unsupported command, provide a helpful message
-                return f"""### Command '{original_command}' Attempted
-
-    **Status:** This command cannot be directly executed through the Kubernetes Python client.
-
-    **Explanation:** Some kubectl commands like cluster-info, version, api-resources, etc. require direct access to the kubectl binary or additional cluster permissions that aren't available through the programmatic API.
-
-    **Supported Operations:**
-    - Resource listing (pods, services, deployments, namespaces, nodes)
-    - Resource description (pods)
-    - Log retrieval (pod logs)
-    - Field and label selector filtering
-
-    **Alternative:** Run this command directly on a machine with kubectl configured and cluster access."""
+                # Return helpful message for unsupported commands
+                return await self._handle_unsupported_command(original_command)
                 
         except Exception as e:
             return f"Error executing kubectl command: {str(e)}"
     
-    async def _execute_unsupported_command(self, command: str) -> str:
-        """
-        Attempt to execute unsupported kubectl commands by making a best-effort attempt
-        to map them to appropriate API calls.
-        """
+    def _get_client_unavailable_message(self) -> str:
+        """Return message when Kubernetes client is not available."""
+        return """### Kubernetes Client Not Available
+
+**Status:** The Kubernetes Python client failed to initialize.
+
+**Possible causes:**
+- No kubeconfig file found
+- Invalid cluster credentials
+- Network connectivity issues
+- Missing cluster access permissions
+
+**Solutions:**
+1. Check if kubeconfig exists at ~/.kube/config
+2. Set KUBERNETES_CONFIG_PATH environment variable
+3. Enable subprocess execution with ENABLE_KUBECTL_SUBPROCESS=true
+4. Verify cluster connectivity and permissions
+
+**Note:** Some commands may still work if subprocess execution is enabled."""
+    
+    async def _execute_kubectl_via_subprocess(self, command: str, format_type: str = "yaml") -> str:
+        """Execute kubectl command via subprocess with security measures."""
+        # Security check: validate command
+        if not self._is_safe_kubectl_command(command):
+            return f"Error: Command '{command}' is not allowed for security reasons."
+        
         try:
-            # Log that we're attempting an unsupported command
-            logger.info(f"Attempting to execute unsupported command: {command}")
-            
-            # Parse the command to extract meaningful information
-            parts = command.strip().split()
-            verb = parts[0] if parts else ""
-            
-            # Handle common unsupported commands
-            if verb == "cluster-info":
-                return await self._get_cluster_info()
-            elif verb == "version":
-                return await self._get_version()
-            elif verb == "config":
-                return await self._handle_config_command(command)
-            elif "api-resources" in command:
-                return await self._get_api_resources()
-            elif "api-versions" in command:
-                return await self._get_api_versions()
+            # Parse command to ensure it starts with kubectl
+            parts = shlex.split(command)
+            if not parts or parts[0].lower() != "kubectl":
+                parts.insert(0, self.kubectl_path)
             else:
-                # For other commands, try to provide a helpful message
-                return f"""Command '{command}' is not directly supported in this application.
-
-**Supported commands:**
-- get pods [--all-namespaces] [--field-selector=...] [--selector=...]
-- get services [--all-namespaces] [--field-selector=...]
-- get deployments [--all-namespaces] [--field-selector=...]
-- get namespaces
-- get nodes
-- describe pod <pod-name> [-n namespace]
-- logs <pod-name> [-n namespace] [--tail=lines]
-
-**Note:** The command was attempted but could not be executed directly through the Kubernetes Python client. You may need to run this command directly on a machine with kubectl access."""
+                parts[0] = self.kubectl_path
+            
+            # Add output format if not specified
+            if format_type == "json" and "--output" not in command and "-o" not in command:
+                parts.extend(["--output", "json"])
+            elif format_type == "yaml" and "--output" not in command and "-o" not in command:
+                parts.extend(["--output", "yaml"])
+            
+            # Execute command with timeout
+            logger.info(f"Executing kubectl via subprocess: {' '.join(parts)}")
+            result = subprocess.run(
+                parts,
+                capture_output=True,
+                text=True,
+                timeout=30,  # 30 second timeout
+                cwd=os.getcwd()
+            )
+            
+            if result.returncode == 0:
+                output = result.stdout.strip()
+                if not output:
+                    return "Command executed successfully but returned no output."
                 
-        except Exception as e:
-            logger.error(f"Error executing unsupported command: {str(e)}")
-            return f"""Cannot execute command '{command}'.
-
-**Error:** {str(e)}
-
-**Note:** This command is not supported by the Kubernetes Python client interface. Common unsupported commands include:
-- cluster-info
-- version
-- config commands
-- port-forward
-- exec
-- apply/delete (for security reasons)
-
-Please run these commands directly on a machine with kubectl access."""
-    
-    async def _get_cluster_info(self) -> str:
-        """Get cluster information using available APIs."""
-        try:
-            # Get some basic cluster information
-            info = "### Cluster Information\n\n"
-            
-            # Get server version
-            try:
-                version = self.v1.api_client.get_api_version()
-                info += f"**API Version:** {version}\n"
-            except:
-                pass
-            
-            # Get nodes summary
-            try:
-                nodes = self.v1.list_node()
-                info += f"**Nodes:** {len(nodes.items)} nodes\n"
-            except:
-                pass
-            
-            # Get namespaces summary
-            try:
-                namespaces = self.v1.list_namespace()
-                info += f"**Namespaces:** {len(namespaces.items)} namespaces\n"
-            except:
-                pass
-            
-            info += "\n**Note:** This is a limited cluster info view. For complete cluster-info, use kubectl directly."
-            return info
-            
-        except Exception as e:
-            return f"Error getting cluster info: {str(e)}"
-    
-    async def _get_version(self) -> str:
-        """Get Kubernetes version information."""
-        try:
-            version_info = self.v1.api_client.configuration.version
-            return f"### Kubernetes Version\n\n**Client Version:** {version_info}\n\n**Note:** Server version information requires kubectl access."
-        except Exception as e:
-            return f"Error getting version: {str(e)}"
-    
-    async def _handle_config_command(self, command: str) -> str:
-        """Handle kubectl config commands."""
-        return """### Config Commands Not Supported
-
-Config commands like `kubectl config` are not supported in this application for security reasons.
-
-**Available config-related information:**
-- Current context is automatically determined by the Kubernetes service configuration
-- Authentication is handled through the configured service account or kubeconfig
-
-**Note:** To manage kubectl configuration, use kubectl directly on a machine with appropriate access."""
-    
-    async def _get_api_resources(self) -> str:
-        """Get available API resources."""
-        try:
-            # This is a simplified version - full API resources would require more complex calls
-            resources = "### Available API Resources\n\n"
-            resources += "**Supported in this application:**\n"
-            resources += "- pods\n"
-            resources += "- services\n"
-            resources += "- deployments\n"
-            resources += "- namespaces\n"
-            resources += "- nodes\n\n"
-            resources += "**Note:** This is a limited view. For complete API resources, use `kubectl api-resources` directly."
-            return resources
-        except Exception as e:
-            return f"Error getting API resources: {str(e)}"
-    
-    async def _get_api_versions(self) -> str:
-        """Get available API versions."""
-        try:
-            versions = "### Available API Versions\n\n"
-            
-            # Get core API version
-            try:
-                core_api = self.v1.api_client.configuration.host + "/api"
-                versions += f"**Core API:** /api/v1\n"
-            except:
-                pass
-            
-            versions += "\n**Note:** This is a limited view. For complete API versions, use `kubectl api-versions` directly."
-            return versions
-        except Exception as e:
-            return f"Error getting API versions: {str(e)}"
-    
-    # ... [Rest of the methods remain the same as before]
-    # ... [_get_namespaces, _get_nodes, _describe_pod, _get_pods, _get_services, _get_deployments, _get_logs]
-    # ... [All formatting methods remain the same]
-    
-    async def _get_namespaces(self, command: str, format_type: str) -> str:
-        """Get namespaces information."""
-        try:
-            namespaces = self.v1.list_namespace()
-            
-            if format_type == "table":
-                return self._format_namespaces_as_table(namespaces)
-            elif format_type == "json":
-                return json.dumps([self._namespace_to_dict(ns) for ns in namespaces.items], indent=2)
-            else:  # yaml format
-                return self._format_namespaces_as_yaml(namespaces)
-                
-        except ApiException as e:
-            return f"Error getting namespaces: {e.reason}"
-    
-    async def _get_nodes(self, command: str, format_type: str) -> str:
-        """Get nodes information."""
-        try:
-            nodes = self.v1.list_node()
-            
-            if format_type == "table":
-                return self._format_nodes_as_table(nodes)
-            elif format_type == "json":
-                return json.dumps([self._node_to_dict(node) for node in nodes.items], indent=2)
-            else:  # yaml format
-                return self._format_nodes_as_yaml(nodes)
-                
-        except ApiException as e:
-            return f"Error getting nodes: {e.reason}"
-    
-    async def _describe_pod(self, command: str, format_type: str) -> str:
-        """Describe a specific pod."""
-        # Parse pod name and namespace
-        parts = command.split()
-        pod_name = None
-        namespace = "noticeboard"
-        
-        # Find pod name and namespace in the command
-        # Skip the initial "kubectl describe pod" part
-        command_part_index = 0
-        
-        # Skip past the command keywords
-        for i, part in enumerate(parts):
-            if part in ["kubectl", "describe", "pod"]:
-                command_part_index = i + 1
+                # Format output based on type
+                if format_type == "table" and not any(flag in command for flag in ["-o", "--output"]):
+                    return f"### kubectl Command: {command}\n\n```\n{output}\n```"
+                elif format_type == "json":
+                    try:
+                        parsed = json.loads(output)
+                        return f"### kubectl Command: {command}\n\n```json\n{json.dumps(parsed, indent=2)}\n```"
+                    except json.JSONDecodeError:
+                        return f"### kubectl Command: {command}\n\n```\n{output}\n```"
+                else:
+                    return f"### kubectl Command: {command}\n\n```yaml\n{output}\n```"
             else:
-                break
-        
-        # Now parse from after the command keywords
-        skip_next = False
-        for i in range(command_part_index, len(parts)):
-            part = parts[i]
-            
-            if skip_next:
-                skip_next = False
-                continue
+                error_output = result.stderr.strip()
+                return f"Error executing command '{command}':\n```\n{error_output}\n```"
                 
-            if part in ["-n", "--namespace"] and i + 1 < len(parts):
-                namespace = parts[i + 1]
-                skip_next = True
-            elif not part.startswith("--") and not part.startswith("-"):
-                # This should be the pod name (first non-flag argument after command)
-                pod_name = part
-                break
-        
-        if not pod_name:
-            return "Error: Pod name is required for describe command"
-        
-        # Debug logging
-        logger.info(f"Attempting to describe pod: '{pod_name}' in namespace: '{namespace}'")
-        
-        try:
-            pod = self.v1.read_namespaced_pod(name=pod_name, namespace=namespace)
-            
-            # Format pod description
-            description = f"### Pod Description: {pod_name}\n\n"
-            description += f"**Namespace:** {pod.metadata.namespace}\n"
-            description += f"**Status:** {pod.status.phase}\n"
-            description += f"**Node:** {pod.spec.node_name or 'Not assigned'}\n"
-            description += f"**Created:** {pod.metadata.creation_timestamp}\n"
-            
-            # Container information
-            if pod.spec.containers:
-                description += f"\n**Containers:**\n"
-                for container in pod.spec.containers:
-                    description += f"- **{container.name}**\n"
-                    description += f"  - Image: {container.image}\n"
-                    if container.resources:
-                        if container.resources.requests:
-                            description += f"  - Requests: {dict(container.resources.requests)}\n"
-                        if container.resources.limits:
-                            description += f"  - Limits: {dict(container.resources.limits)}\n"
-            
-            # Labels
-            if pod.metadata.labels:
-                description += f"\n**Labels:**\n"
-                for key, value in pod.metadata.labels.items():
-                    description += f"- {key}: {value}\n"
-            
-            # Annotations (first few)
-            if pod.metadata.annotations:
-                description += f"\n**Annotations (sample):**\n"
-                # Show only first 5 annotations to avoid clutter
-                for i, (key, value) in enumerate(pod.metadata.annotations.items()):
-                    if i >= 5:
-                        description += f"- ... and {len(pod.metadata.annotations) - 5} more\n"
-                        break
-                    # Truncate long values
-                    display_value = value[:100] + "..." if len(value) > 100 else value
-                    description += f"- {key}: {display_value}\n"
-            
-            # Conditions
-            if pod.status.conditions:
-                description += f"\n**Conditions:**\n"
-                for condition in pod.status.conditions:
-                    description += f"- {condition.type}: {condition.status}"
-                    if condition.reason:
-                        description += f" (Reason: {condition.reason})"
-                    description += "\n"
-            
-            # Container statuses
-            if pod.status.container_statuses:
-                description += f"\n**Container Statuses:**\n"
-                for status in pod.status.container_statuses:
-                    description += f"- **{status.name}:**\n"
-                    description += f"  - Ready: {status.ready}\n"
-                    description += f"  - Restart Count: {status.restart_count}\n"
-                    if status.state:
-                        if status.state.running:
-                            description += f"  - State: Running (since {status.state.running.started_at})\n"
-                        elif status.state.waiting:
-                            description += f"  - State: Waiting (reason: {status.state.waiting.reason})\n"
-                        elif status.state.terminated:
-                            description += f"  - State: Terminated (reason: {status.state.terminated.reason})\n"
-            
-            return description
-            
-        except ApiException as e:
-            if e.status == 404:
-                return f"Error describing pod {pod_name}: Pod not found in namespace '{namespace}'. Please check the pod name and namespace."
-            else:
-                return f"Error describing pod {pod_name}: {e.reason}"
+        except subprocess.TimeoutExpired:
+            return f"Error: Command '{command}' timed out after 30 seconds."
         except Exception as e:
-            return f"Error describing pod {pod_name}: {str(e)}"
+            logger.error(f"Subprocess execution error: {str(e)}")
+            return f"Error executing command via subprocess: {str(e)}"
     
+    def _is_safe_kubectl_command(self, command: str) -> bool:
+        """Validate that the kubectl command is safe to execute."""
+        normalized = command.strip().lower()
+        parts = shlex.split(normalized)
+        
+        if not parts:
+            return False
+        
+        # Skip 'kubectl' if it's the first word
+        if parts[0] == "kubectl":
+            parts = parts[1:]
+        
+        if not parts:
+            return False
+        
+        # Check if the main verb is allowed
+        main_verb = parts[0]
+        if main_verb not in self.allowed_kubectl_commands:
+            logger.warning(f"Blocked unsafe kubectl command: {main_verb}")
+            return False
+        
+        # Block dangerous commands explicitly
+        dangerous_patterns = [
+            r'delete\s+', r'apply\s+', r'create\s+', r'patch\s+',
+            r'edit\s+', r'exec\s+', r'cp\s+', r'auth\s+'
+        ]
+        
+        for pattern in dangerous_patterns:
+            if re.search(pattern, normalized):
+                logger.warning(f"Blocked dangerous kubectl command: {command}")
+                return False
+        
+        # Check for shell metacharacters
+        shell_chars = ['&', '|', ';', '`', '$', '<', '>', '(', ')', '{', '}']
+        if any(char in command for char in shell_chars):
+            logger.warning(f"Blocked kubectl command with shell metacharacters: {command}")
+            return False
+        
+        return True
+    
+    async def _handle_unsupported_command(self, command: str) -> str:
+        """Provide helpful information about unsupported commands."""
+        return f"""### Command Not Supported: {command}
+
+**Status:** This command is not available through the Kubernetes Python client.
+
+**Supported Operations:**
+- Resource listing: `get pods`, `get services`, `get deployments`, `get namespaces`, `get nodes`
+- Resource description: `describe pod <n>`
+- Log retrieval: `logs <pod-name>`
+
+**Note:** For advanced kubectl commands, enable subprocess execution with ENABLE_KUBECTL_SUBPROCESS=true or use kubectl directly."""
+    
+    # Core kubectl functionality methods
     async def _get_pods(self, command: str, format_type: str) -> str:
-        """Get pods information with server-side and client-side filtering fallback."""
+        """Get pods information with support for field selectors."""
         namespace = "default"
+        all_namespaces = False
         label_selector = None
         field_selector = None
-        all_namespaces = False
         client_side_filter = None
         
         # Check for --all-namespaces flag
@@ -482,23 +346,24 @@ Config commands like `kubectl config` are not supported in this application for 
                     label_selector = parts[i + 1]
                     break
         
-        # Parse field selector
+        # Parse field selector and handle != operators that don't work server-side
         if "--field-selector=" in command:
             parts = command.split("--field-selector=")
             if len(parts) > 1:
                 # Extract the field selector value (until next space or end)
-                original_field_selector = parts[1].split()[0]
+                field_selector_value = parts[1].split()[0]
                 
                 # Check if it's a negation that might not work server-side
-                if "!=" in original_field_selector and "status.phase" in original_field_selector:
-                    # Try server-side first, but prepare for client-side fallback
-                    field_selector = original_field_selector
-                    client_side_filter = original_field_selector
+                if "!=" in field_selector_value and "status.phase" in field_selector_value:
+                    # Don't send the != filter to server, handle client-side instead
+                    client_side_filter = field_selector_value
+                    field_selector = None
+                    logger.info(f"Using client-side filtering for: {field_selector_value}")
                 else:
-                    field_selector = original_field_selector
+                    field_selector = field_selector_value
         
         try:
-            # Get pods with server-side filtering
+            # Get pods with server-side filtering (if applicable)
             if all_namespaces:
                 pods = self.v1.list_pod_for_all_namespaces(
                     label_selector=label_selector,
@@ -511,60 +376,42 @@ Config commands like `kubectl config` are not supported in this application for 
                     field_selector=field_selector
                 )
             
-            # Check if server-side filtering worked
-            if client_side_filter and field_selector:
-                # Count pods by status to see if filtering worked
-                status_counts = {}
-                for pod in pods.items:
-                    status = pod.status.phase
-                    status_counts[status] = status_counts.get(status, 0) + 1
+            # Apply client-side filtering if needed
+            if client_side_filter:
+                original_count = len(pods.items)
                 
-                # If we asked for non-Running pods but still got Running pods, server-side failed
-                if "status.phase!=Running" in client_side_filter and status_counts.get("Running", 0) > 0:
-                    logger.warning("Server-side field selector failed, falling back to client-side filtering")
-                    
-                    # Re-fetch without field selector and filter client-side
-                    if all_namespaces:
-                        pods = self.v1.list_pod_for_all_namespaces(label_selector=label_selector)
-                    else:
-                        pods = self.v1.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
-                    
-                    # Apply client-side filtering
-                    if client_side_filter == "status.phase!=Running":
-                        pods.items = [pod for pod in pods.items if pod.status.phase != "Running"]
-                    elif client_side_filter == "status.phase!=Succeeded":
-                        pods.items = [pod for pod in pods.items if pod.status.phase != "Succeeded"]
-                    elif client_side_filter == "status.phase!=Failed":
-                        pods.items = [pod for pod in pods.items if pod.status.phase != "Failed"]
-                    else:
-                        # Generic parsing for other != filters
-                        if "status.phase!=" in client_side_filter:
-                            exclude_status = client_side_filter.split("status.phase!=")[1]
-                            pods.items = [pod for pod in pods.items if pod.status.phase != exclude_status]
+                if client_side_filter == "status.phase!=Running":
+                    pods.items = [pod for pod in pods.items if pod.status.phase != "Running"]
+                elif client_side_filter == "status.phase!=Succeeded":
+                    pods.items = [pod for pod in pods.items if pod.status.phase != "Succeeded"]
+                elif client_side_filter == "status.phase!=Failed":
+                    pods.items = [pod for pod in pods.items if pod.status.phase != "Failed"]
+                else:
+                    # Generic parsing for other != filters
+                    if "status.phase!=" in client_side_filter:
+                        exclude_status = client_side_filter.split("status.phase!=")[1]
+                        pods.items = [pod for pod in pods.items if pod.status.phase != exclude_status]
+                
+                filtered_count = len(pods.items)
+                logger.info(f"Client-side filtering: {original_count} -> {filtered_count} pods")
             
-            # Add a note about filtering method used
+            # Format response with optional filtering note
             result = ""
-            if client_side_filter and len(pods.items) == 0:
-                result += "**Note:** No pods found matching the filter criteria.\n\n"
-            elif client_side_filter:
-                # Check if client-side filtering was used
-                has_excluded_status = any(pod.status.phase == client_side_filter.split("!=")[1] 
-                                        for pod in pods.items if "!=" in client_side_filter)
-                if not has_excluded_status:
-                    result += "**Note:** Results filtered client-side due to API limitations.\n\n"
+            if client_side_filter:
+                result += f"**Note:** Filtered {len(pods.items)} pods client-side (field-selector '{client_side_filter}' not supported server-side)\n\n"
             
             if format_type == "table":
                 result += self._format_pods_as_table(pods)
             elif format_type == "json":
                 result += json.dumps([self._pod_to_dict(pod) for pod in pods.items], indent=2)
-            else:  # yaml format
+            else:
                 result += self._format_pods_as_yaml(pods)
             
             return result
                 
         except ApiException as e:
             logger.error(f"Kubernetes API error: {e}")
-            return f"Error getting pods: {e.reason}. The field selector '{field_selector}' may not be supported by this Kubernetes version."
+            return f"Error getting pods: {e.reason}. Field selector '{field_selector}' may not be supported by this Kubernetes version."
         except Exception as e:
             logger.error(f"Unexpected error: {str(e)}")
             return f"Error getting pods: {str(e)}"
@@ -573,13 +420,10 @@ Config commands like `kubectl config` are not supported in this application for 
         """Get services information."""
         namespace = "default"
         all_namespaces = False
-        field_selector = None
         
-        # Check for --all-namespaces flag
         if "--all-namespaces" in command:
             all_namespaces = True
         
-        # Parse specific namespace from command (only if not all-namespaces)
         if not all_namespaces and ("-n " in command or "--namespace " in command):
             parts = command.split()
             for i, part in enumerate(parts):
@@ -587,26 +431,17 @@ Config commands like `kubectl config` are not supported in this application for 
                     namespace = parts[i + 1]
                     break
         
-        # Parse field selector
-        if "--field-selector=" in command:
-            parts = command.split("--field-selector=")
-            if len(parts) > 1:
-                # Extract the field selector value (until next space or end)
-                field_selector = parts[1].split()[0]
-        
         try:
             if all_namespaces:
-                # Get services from all namespaces
-                services = self.v1.list_service_for_all_namespaces(field_selector=field_selector)
+                services = self.v1.list_service_for_all_namespaces()
             else:
-                # Get services from specific namespace
-                services = self.v1.list_namespaced_service(namespace=namespace, field_selector=field_selector)
+                services = self.v1.list_namespaced_service(namespace=namespace)
             
             if format_type == "table":
                 return self._format_services_as_table(services)
             elif format_type == "json":
                 return json.dumps([self._service_to_dict(svc) for svc in services.items], indent=2)
-            else:  # yaml format
+            else:
                 return self._format_services_as_yaml(services)
                 
         except ApiException as e:
@@ -616,13 +451,10 @@ Config commands like `kubectl config` are not supported in this application for 
         """Get deployments information."""
         namespace = "default"
         all_namespaces = False
-        field_selector = None
         
-        # Check for --all-namespaces flag
         if "--all-namespaces" in command:
             all_namespaces = True
         
-        # Parse specific namespace from command (only if not all-namespaces)
         if not all_namespaces and ("-n " in command or "--namespace " in command):
             parts = command.split()
             for i, part in enumerate(parts):
@@ -630,46 +462,111 @@ Config commands like `kubectl config` are not supported in this application for 
                     namespace = parts[i + 1]
                     break
         
-        # Parse field selector
-        if "--field-selector=" in command:
-            parts = command.split("--field-selector=")
-            if len(parts) > 1:
-                # Extract the field selector value (until next space or end)
-                field_selector = parts[1].split()[0]
-        
         try:
             if all_namespaces:
-                # Get deployments from all namespaces
-                deployments = self.apps_v1.list_deployment_for_all_namespaces(field_selector=field_selector)
+                deployments = self.apps_v1.list_deployment_for_all_namespaces()
             else:
-                # Get deployments from specific namespace
-                deployments = self.apps_v1.list_namespaced_deployment(namespace=namespace, field_selector=field_selector)
+                deployments = self.apps_v1.list_namespaced_deployment(namespace=namespace)
             
             if format_type == "table":
                 return self._format_deployments_as_table(deployments)
             elif format_type == "json":
                 return json.dumps([self._deployment_to_dict(deploy) for deploy in deployments.items], indent=2)
-            else:  # yaml format
+            else:
                 return self._format_deployments_as_yaml(deployments)
                 
         except ApiException as e:
             return f"Error getting deployments: {e.reason}"
     
-    async def _get_logs(self, command: str, format_type: str) -> str:
-        """Get pod logs."""
-        # Parse pod name and namespace
+    async def _get_namespaces(self, command: str, format_type: str) -> str:
+        """Get namespaces information."""
+        try:
+            namespaces = self.v1.list_namespace()
+            
+            if format_type == "table":
+                return self._format_namespaces_as_table(namespaces)
+            elif format_type == "json":
+                return json.dumps([self._namespace_to_dict(ns) for ns in namespaces.items], indent=2)
+            else:
+                return self._format_namespaces_as_yaml(namespaces)
+                
+        except ApiException as e:
+            return f"Error getting namespaces: {e.reason}"
+    
+    async def _get_nodes(self, command: str, format_type: str) -> str:
+        """Get nodes information."""
+        try:
+            nodes = self.v1.list_node()
+            
+            if format_type == "table":
+                return self._format_nodes_as_table(nodes)
+            elif format_type == "json":
+                return json.dumps([self._node_to_dict(node) for node in nodes.items], indent=2)
+            else:
+                return self._format_nodes_as_yaml(nodes)
+                
+        except ApiException as e:
+            return f"Error getting nodes: {e.reason}"
+    
+    async def _describe_pod(self, command: str, format_type: str) -> str:
+        """Describe a specific pod."""
         parts = command.split()
         pod_name = None
         namespace = "default"
-        container = None
-        lines = 100  # Default line limit
+        
+        # Parse pod name and namespace
+        skip_next = False
+        for i, part in enumerate(parts):
+            if skip_next:
+                skip_next = False
+                continue
+                
+            if part in ["-n", "--namespace"] and i + 1 < len(parts):
+                namespace = parts[i + 1]
+                skip_next = True
+            elif not part.startswith("-") and part not in ["kubectl", "describe", "pod"]:
+                pod_name = part
+                break
+        
+        if not pod_name:
+            return "Error: Pod name is required for describe command"
+        
+        try:
+            pod = self.v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+            
+            description = f"### Pod Description: {pod_name}\n\n"
+            description += f"**Namespace:** {pod.metadata.namespace}\n"
+            description += f"**Status:** {pod.status.phase}\n"
+            description += f"**Node:** {pod.spec.node_name or 'Not assigned'}\n"
+            description += f"**Created:** {pod.metadata.creation_timestamp}\n"
+            
+            # Container information
+            if pod.spec.containers:
+                description += f"\n**Containers:**\n"
+                for container in pod.spec.containers:
+                    description += f"- **{container.name}**: {container.image}\n"
+            
+            return description
+            
+        except ApiException as e:
+            if e.status == 404:
+                return f"Pod '{pod_name}' not found in namespace '{namespace}'"
+            else:
+                return f"Error describing pod: {e.reason}"
+    
+    async def _get_logs(self, command: str, format_type: str) -> str:
+        """Get pod logs."""
+        parts = command.split()
+        pod_name = None
+        namespace = "default"
+        lines = 100
         
         for i, part in enumerate(parts):
             if part in ["-n", "--namespace"] and i + 1 < len(parts):
                 namespace = parts[i + 1]
             elif part.startswith("--tail="):
                 lines = int(part.split("=")[1])
-            elif part not in ["get", "logs", "-n", "--namespace"] and not part.startswith("--"):
+            elif part not in ["kubectl", "logs", "-n", "--namespace"] and not part.startswith("--"):
                 pod_name = part
                 break
         
@@ -678,43 +575,44 @@ Config commands like `kubectl config` are not supported in this application for 
         
         try:
             logs = self.v1.read_namespaced_pod_log(
-                name=pod_name,
-                namespace=namespace,
-                container=container,
+                name=pod_name, 
+                namespace=namespace, 
                 tail_lines=lines
             )
-            
             return f"### Logs for pod {pod_name} (last {lines} lines)\n\n```\n{logs}\n```"
             
         except ApiException as e:
             return f"Error getting logs: {e.reason}"
     
-    # ... (all the formatting methods stay the same)
-    
+    # Formatting methods
     def _format_pods_as_table(self, pods) -> str:
         """Format pods as a markdown table."""
         if not pods.items:
-            return "No pods found."
+            return "No pods found matching the criteria."
         
         table = "### Pods\n\n"
-        table += "| Name | Namespace | Status | Restarts | Age |\n"
-        table += "| --- | --- | --- | --- | --- |\n"
+        table += "| Name | Namespace | Status | Age |\n"
+        table += "| --- | --- | --- | --- |\n"
         
         for pod in pods.items:
             name = pod.metadata.name
             namespace = pod.metadata.namespace
             status = pod.status.phase
-            
-            # Calculate restarts
-            restarts = 0
-            if pod.status.container_statuses:
-                restarts = sum(cs.restart_count for cs in pod.status.container_statuses)
-            
-            # Calculate age
-            creation_time = pod.metadata.creation_timestamp
-            age = self._calculate_age(creation_time)
-            
-            table += f"| {name} | {namespace} | {status} | {restarts} | {age} |\n"
+            age = self._calculate_age(pod.metadata.creation_timestamp)
+            table += f"| {name} | {namespace} | **{status}** | {age} |\n"
+        
+        # Add summary
+        status_counts = {}
+        for pod in pods.items:
+            status = pod.status.phase
+            status_counts[status] = status_counts.get(status, 0) + 1
+        
+        if status_counts:
+            table += f"\n**Summary:** "
+            summary_parts = []
+            for status, count in sorted(status_counts.items()):
+                summary_parts.append(f"{count} {status}")
+            table += ", ".join(summary_parts)
         
         return table
     
@@ -724,8 +622,8 @@ Config commands like `kubectl config` are not supported in this application for 
             return "No services found."
         
         table = "### Services\n\n"
-        table += "| Name | Namespace | Type | Cluster-IP | External-IP | Port(s) |\n"
-        table += "| --- | --- | --- | --- | --- | --- |\n"
+        table += "| Name | Namespace | Type | Cluster-IP | Port(s) |\n"
+        table += "| --- | --- | --- | --- | --- |\n"
         
         for svc in services.items:
             name = svc.metadata.name
@@ -733,22 +631,33 @@ Config commands like `kubectl config` are not supported in this application for 
             svc_type = svc.spec.type
             cluster_ip = svc.spec.cluster_ip
             
-            # External IP
-            external_ip = "None"
-            if svc.status.load_balancer and svc.status.load_balancer.ingress:
-                external_ip = svc.status.load_balancer.ingress[0].ip or "Pending"
-            
-            # Ports
             ports = []
             if svc.spec.ports:
                 for port in svc.spec.ports:
-                    port_str = f"{port.port}"
-                    if port.protocol != "TCP":
-                        port_str += f"/{port.protocol}"
-                    ports.append(port_str)
+                    ports.append(f"{port.port}/{port.protocol}")
             ports_str = ",".join(ports) if ports else "None"
             
-            table += f"| {name} | {namespace} | {svc_type} | {cluster_ip} | {external_ip} | {ports_str} |\n"
+            table += f"| {name} | {namespace} | {svc_type} | {cluster_ip} | {ports_str} |\n"
+        
+        return table
+    
+    def _format_deployments_as_table(self, deployments) -> str:
+        """Format deployments as a markdown table."""
+        if not deployments.items:
+            return "No deployments found."
+        
+        table = "### Deployments\n\n"
+        table += "| Name | Namespace | Ready | Age |\n"
+        table += "| --- | --- | --- | --- |\n"
+        
+        for deploy in deployments.items:
+            name = deploy.metadata.name
+            namespace = deploy.metadata.namespace
+            replicas = deploy.spec.replicas or 0
+            ready_replicas = deploy.status.ready_replicas or 0
+            ready_str = f"{ready_replicas}/{replicas}"
+            age = self._calculate_age(deploy.metadata.creation_timestamp)
+            table += f"| {name} | {namespace} | {ready_str} | {age} |\n"
         
         return table
     
@@ -764,11 +673,7 @@ Config commands like `kubectl config` are not supported in this application for 
         for ns in namespaces.items:
             name = ns.metadata.name
             status = ns.status.phase
-            
-            # Calculate age
-            creation_time = ns.metadata.creation_timestamp
-            age = self._calculate_age(creation_time)
-            
+            age = self._calculate_age(ns.metadata.creation_timestamp)
             table += f"| {name} | {status} | {age} |\n"
         
         return table
@@ -779,13 +684,11 @@ Config commands like `kubectl config` are not supported in this application for 
             return "No nodes found."
         
         table = "### Nodes\n\n"
-        table += "| Name | Status | Roles | Age | Version |\n"
-        table += "| --- | --- | --- | --- | --- |\n"
+        table += "| Name | Status | Age | Version |\n"
+        table += "| --- | --- | --- | --- |\n"
         
         for node in nodes.items:
             name = node.metadata.name
-            
-            # Get status
             status = "Unknown"
             if node.status.conditions:
                 for condition in node.status.conditions:
@@ -793,53 +696,9 @@ Config commands like `kubectl config` are not supported in this application for 
                         status = "Ready" if condition.status == "True" else "NotReady"
                         break
             
-            # Get roles
-            roles = []
-            if node.metadata.labels:
-                for key, value in node.metadata.labels.items():
-                    if key.startswith("node-role.kubernetes.io/"):
-                        role = key.split("/")[-1]
-                        if role:
-                            roles.append(role)
-            roles_str = ",".join(roles) if roles else "worker"
-            
-            # Calculate age
-            creation_time = node.metadata.creation_timestamp
-            age = self._calculate_age(creation_time)
-            
-            # Get version
+            age = self._calculate_age(node.metadata.creation_timestamp)
             version = node.status.node_info.kubelet_version if node.status.node_info else "Unknown"
-            
-            table += f"| {name} | {status} | {roles_str} | {age} | {version} |\n"
-        
-        return table
-    
-    def _format_deployments_as_table(self, deployments) -> str:
-        """Format deployments as a markdown table."""
-        if not deployments.items:
-            return "No deployments found."
-        
-        table = "### Deployments\n\n"
-        table += "| Name | Namespace | Ready | Up-to-date | Available | Age |\n"
-        table += "| --- | --- | --- | --- | --- | --- |\n"
-        
-        for deploy in deployments.items:
-            name = deploy.metadata.name
-            namespace = deploy.metadata.namespace
-            
-            # Get replica counts
-            replicas = deploy.spec.replicas or 0
-            ready_replicas = deploy.status.ready_replicas or 0
-            updated_replicas = deploy.status.updated_replicas or 0
-            available_replicas = deploy.status.available_replicas or 0
-            
-            ready_str = f"{ready_replicas}/{replicas}"
-            
-            # Calculate age
-            creation_time = deploy.metadata.creation_timestamp
-            age = self._calculate_age(creation_time)
-            
-            table += f"| {name} | {namespace} | {ready_str} | {updated_replicas} | {available_replicas} | {age} |\n"
+            table += f"| {name} | {status} | {age} | {version} |\n"
         
         return table
     
@@ -857,92 +716,24 @@ Config commands like `kubectl config` are not supported in this application for 
             return f"{age.seconds // 60}m"
         else:
             return f"{age.seconds}s"
-        
-    # Add these missing methods to the KubernetesService class
-
-    async def _execute_generic_command(self, command: str, format_type: str) -> str:
-        """Execute generic kubectl commands that don't match specific patterns."""
-        return f"Command '{command}' is not yet supported. Please use one of the supported commands: get pods, get services, get deployments, get namespaces, get nodes, describe pod, or get logs."
     
-    def _namespace_to_dict(self, namespace) -> dict:
-        """Convert namespace object to dictionary."""
-        return {
-            "name": namespace.metadata.name,
-            "status": namespace.status.phase,
-            "creation_timestamp": namespace.metadata.creation_timestamp.isoformat() if namespace.metadata.creation_timestamp else None,
-            "labels": namespace.metadata.labels or {}
-        }
-    
-    def _node_to_dict(self, node) -> dict:
-        """Convert node object to dictionary."""
-        # Get status
-        status = "Unknown"
-        if node.status.conditions:
-            for condition in node.status.conditions:
-                if condition.type == "Ready":
-                    status = "Ready" if condition.status == "True" else "NotReady"
-                    break
-        
-        # Get roles
-        roles = []
-        if node.metadata.labels:
-            for key, value in node.metadata.labels.items():
-                if key.startswith("node-role.kubernetes.io/"):
-                    role = key.split("/")[-1]
-                    if role:
-                        roles.append(role)
-        
-        return {
-            "name": node.metadata.name,
-            "status": status,
-            "roles": roles if roles else ["worker"],
-            "version": node.status.node_info.kubelet_version if node.status.node_info else "Unknown",
-            "creation_timestamp": node.metadata.creation_timestamp.isoformat() if node.metadata.creation_timestamp else None
-        }
-    
+    # Dictionary conversion methods for JSON/YAML output
     def _pod_to_dict(self, pod) -> dict:
         """Convert pod object to dictionary."""
-        # Calculate restarts
-        restarts = 0
-        if pod.status.container_statuses:
-            restarts = sum(cs.restart_count for cs in pod.status.container_statuses)
-        
         return {
             "name": pod.metadata.name,
             "namespace": pod.metadata.namespace,
             "status": pod.status.phase,
-            "restarts": restarts,
-            "creation_timestamp": pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else None,
-            "labels": pod.metadata.labels or {}
+            "creation_timestamp": pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else None
         }
     
     def _service_to_dict(self, service) -> dict:
         """Convert service object to dictionary."""
-        # External IP
-        external_ip = None
-        if service.status.load_balancer and service.status.load_balancer.ingress:
-            external_ip = service.status.load_balancer.ingress[0].ip
-        
-        # Ports
-        ports = []
-        if service.spec.ports:
-            for port in service.spec.ports:
-                port_dict = {
-                    "port": port.port,
-                    "protocol": port.protocol,
-                    "target_port": port.target_port
-                }
-                if port.node_port:
-                    port_dict["node_port"] = port.node_port
-                ports.append(port_dict)
-        
         return {
             "name": service.metadata.name,
             "namespace": service.metadata.namespace,
             "type": service.spec.type,
             "cluster_ip": service.spec.cluster_ip,
-            "external_ip": external_ip,
-            "ports": ports,
             "creation_timestamp": service.metadata.creation_timestamp.isoformat() if service.metadata.creation_timestamp else None
         }
     
@@ -953,11 +744,34 @@ Config commands like `kubectl config` are not supported in this application for 
             "namespace": deployment.metadata.namespace,
             "replicas": deployment.spec.replicas or 0,
             "ready_replicas": deployment.status.ready_replicas or 0,
-            "updated_replicas": deployment.status.updated_replicas or 0,
-            "available_replicas": deployment.status.available_replicas or 0,
             "creation_timestamp": deployment.metadata.creation_timestamp.isoformat() if deployment.metadata.creation_timestamp else None
         }
     
+    def _namespace_to_dict(self, namespace) -> dict:
+        """Convert namespace object to dictionary."""
+        return {
+            "name": namespace.metadata.name,
+            "status": namespace.status.phase,
+            "creation_timestamp": namespace.metadata.creation_timestamp.isoformat() if namespace.metadata.creation_timestamp else None
+        }
+    
+    def _node_to_dict(self, node) -> dict:
+        """Convert node object to dictionary."""
+        status = "Unknown"
+        if node.status.conditions:
+            for condition in node.status.conditions:
+                if condition.type == "Ready":
+                    status = "Ready" if condition.status == "True" else "NotReady"
+                    break
+        
+        return {
+            "name": node.metadata.name,
+            "status": status,
+            "version": node.status.node_info.kubelet_version if node.status.node_info else "Unknown",
+            "creation_timestamp": node.metadata.creation_timestamp.isoformat() if node.metadata.creation_timestamp else None
+        }
+    
+    # YAML formatting methods
     def _format_pods_as_yaml(self, pods) -> str:
         """Format pods as YAML."""
         if not pods.items:
@@ -966,7 +780,7 @@ Config commands like `kubectl config` are not supported in this application for 
         yaml_content = "### Pods (YAML)\n\n```yaml\n"
         for pod in pods.items:
             pod_dict = self._pod_to_dict(pod)
-            yaml_content += yaml.dump([pod_dict], default_flow_style=False)
+            yaml_content += yaml.dump(pod_dict, default_flow_style=False)
             yaml_content += "---\n"
         yaml_content += "```"
         return yaml_content
@@ -979,7 +793,7 @@ Config commands like `kubectl config` are not supported in this application for 
         yaml_content = "### Services (YAML)\n\n```yaml\n"
         for svc in services.items:
             svc_dict = self._service_to_dict(svc)
-            yaml_content += yaml.dump([svc_dict], default_flow_style=False)
+            yaml_content += yaml.dump(svc_dict, default_flow_style=False)
             yaml_content += "---\n"
         yaml_content += "```"
         return yaml_content
@@ -992,7 +806,7 @@ Config commands like `kubectl config` are not supported in this application for 
         yaml_content = "### Deployments (YAML)\n\n```yaml\n"
         for deploy in deployments.items:
             deploy_dict = self._deployment_to_dict(deploy)
-            yaml_content += yaml.dump([deploy_dict], default_flow_style=False)
+            yaml_content += yaml.dump(deploy_dict, default_flow_style=False)
             yaml_content += "---\n"
         yaml_content += "```"
         return yaml_content
@@ -1005,7 +819,7 @@ Config commands like `kubectl config` are not supported in this application for 
         yaml_content = "### Namespaces (YAML)\n\n```yaml\n"
         for ns in namespaces.items:
             ns_dict = self._namespace_to_dict(ns)
-            yaml_content += yaml.dump([ns_dict], default_flow_style=False)
+            yaml_content += yaml.dump(ns_dict, default_flow_style=False)
             yaml_content += "---\n"
         yaml_content += "```"
         return yaml_content
@@ -1018,154 +832,11 @@ Config commands like `kubectl config` are not supported in this application for 
         yaml_content = "### Nodes (YAML)\n\n```yaml\n"
         for node in nodes.items:
             node_dict = self._node_to_dict(node)
-            yaml_content += yaml.dump([node_dict], default_flow_style=False)
+            yaml_content += yaml.dump(node_dict, default_flow_style=False)
             yaml_content += "---\n"
         yaml_content += "```"
         return yaml_content
     
-    async def _get_cluster_info(self) -> str:
-        """Get cluster information using available APIs."""
-        try:
-            # Get some basic cluster information
-            info = "### Cluster Information\n\n"
-            
-            # Get nodes summary
-            try:
-                nodes = self.v1.list_node()
-                info += f"**Nodes:** {len(nodes.items)} total\n"
-                
-                # Count nodes by status
-                ready_nodes = 0
-                for node in nodes.items:
-                    if node.status.conditions:
-                        for condition in node.status.conditions:
-                            if condition.type == "Ready" and condition.status == "True":
-                                ready_nodes += 1
-                                break
-                
-                info += f"**Ready Nodes:** {ready_nodes}/{len(nodes.items)}\n"
-            except Exception as e:
-                info += f"**Nodes:** Error retrieving node information: {str(e)}\n"
-            
-            # Get namespaces summary
-            try:
-                namespaces = self.v1.list_namespace()
-                info += f"**Namespaces:** {len(namespaces.items)} total\n"
-            except Exception as e:
-                info += f"**Namespaces:** Error retrieving namespace information: {str(e)}\n"
-            
-            # Get API server info
-            try:
-                # Get the API server endpoint from client configuration
-                host = self.v1.api_client.configuration.host
-                info += f"**API Server:** {host}\n"
-            except Exception as e:
-                info += f"**API Server:** Unable to retrieve endpoint information\n"
-            
-            info += "\n**Note:** This is a limited cluster info view using available Kubernetes APIs. For complete cluster-info including endpoints and certificates, use `kubectl cluster-info` directly on a machine with cluster access."
-            return info
-            
-        except Exception as e:
-            return f"Error getting cluster info: {str(e)}"
-    
-    async def _get_version(self) -> str:
-        """Get Kubernetes version information."""
-        try:
-            info = "### Kubernetes Version Information\n\n"
-            
-            # Get client version from configuration
-            try:
-                info += f"**Client API Version:** Using Kubernetes Python client\n"
-            except:
-                info += f"**Client API Version:** Unable to determine\n"
-            
-            # Attempt to get server version through API calls
-            try:
-                # Get version info by making a generic API call
-                response = self.v1.api_client.call_api(
-                    '/version', 'GET',
-                    response_type='object',
-                    auth_settings=['BearerToken']
-                )
-                if response and len(response) > 0:
-                    version_data = response[0]
-                    info += f"**Server Version:** {version_data.get('gitVersion', 'Unknown')}\n"
-                    info += f"**Go Version:** {version_data.get('goVersion', 'Unknown')}\n"
-                    info += f"**Platform:** {version_data.get('platform', 'Unknown')}\n"
-            except:
-                info += f"**Server Version:** Unable to retrieve server version through API\n"
-            
-            info += "\n**Note:** For complete version information including build details, use `kubectl version` directly."
-            return info
-            
-        except Exception as e:
-            return f"Error getting version: {str(e)}"
-    
-    async def _handle_config_command(self, command: str) -> str:
-        """Handle kubectl config commands."""
-        return """### Config Commands
-
-**Status:** Config commands like `kubectl config` are not available through the Kubernetes Python client.
-
-**Reason:** Configuration management requires direct access to kubectl binary and local kubeconfig files.
-
-**Available Information:**
-- The application uses the configured Kubernetes context automatically
-- Authentication is handled through service accounts or kubeconfig files
-- Context switching and cluster management must be done externally
-
-**Note:** To manage kubectl configuration, use kubectl directly on a machine with appropriate access."""
-    
-    async def _get_api_resources(self) -> str:
-        """Get available API resources."""
-        try:
-            resources = "### API Resources\n\n"
-            resources += "**Directly Supported Resources:**\n"
-            resources += "- pods (v1)\n"
-            resources += "- services (v1)\n"
-            resources += "- deployments (apps/v1)\n"
-            resources += "- namespaces (v1)\n"
-            resources += "- nodes (v1)\n\n"
-            
-            # Try to get additional API groups
-            try:
-                # This is a simplified approach - the full API discovery is complex
-                resources += "**Available API Groups:**\n"
-                resources += "- core (v1)\n"
-                resources += "- apps (v1)\n"
-                resources += "- networking.k8s.io (v1)\n"
-                resources += "- storage.k8s.io (v1)\n"
-                resources += "- batch (v1)\n\n"
-            except:
-                pass
-            
-            resources += "**Note:** This is a limited view of API resources. For complete API resource discovery including CRDs and all API groups, use `kubectl api-resources` directly."
-            return resources
-        except Exception as e:
-            return f"Error getting API resources: {str(e)}"
-    
-    async def _get_api_versions(self) -> str:
-        """Get available API versions."""
-        try:
-            versions = "### API Versions\n\n"
-            
-            try:
-                # Get available versions through client configuration
-                versions += "**Supported API Versions:**\n"
-                versions += "- v1 (Core API)\n"
-                versions += "- apps/v1\n"
-                versions += "- networking.k8s.io/v1\n"
-                versions += "- storage.k8s.io/v1\n"
-                versions += "- batch/v1\n\n"
-            except:
-                versions += "**API Versions:** Unable to enumerate all versions\n\n"
-            
-            versions += "**Note:** This is a static list of commonly available API versions. For a complete and dynamic list of all API versions including cluster-specific APIs, use `kubectl api-versions` directly."
-            return versions
-        except Exception as e:
-            return f"Error getting API versions: {str(e)}"
-
-
 # Enhanced script discriminator service
 class ScriptDiscriminator:
     @staticmethod
@@ -1176,13 +847,20 @@ class ScriptDiscriminator:
         """
         text_lower = text.lower().strip()
         
-        # PromQL patterns
+        # PromQL patterns - improved to catch filesystem queries
         promql_patterns = [
             r'\b(rate|sum|avg|max|min|count|histogram_quantile|increase)\s*\(',
             r'\[[\d]+[smhd]\]',  # Time ranges like [5m], [1h]
             r'\{[^}]*\}',  # Label selectors
             r'by\s*\([^)]+\)',  # Group by
             r'without\s*\([^)]+\)',  # Group without
+            r'node_filesystem_',  # Node filesystem metrics
+            r'node_memory_',  # Node memory metrics
+            r'node_cpu_',  # Node CPU metrics
+            r'container_memory_',  # Container metrics
+            r'up\s*\{',  # Up metrics with labels
+            r'_total\s*$',  # Metrics ending with _total
+            r'_bytes\s*/',  # Metrics with _bytes (common in filesystem queries)
         ]
         
         # Kubernetes command patterns
@@ -1191,33 +869,60 @@ class ScriptDiscriminator:
             r'\b(pods|pod|services|svc|deployments|deploy|nodes|ns|namespaces)\b',
             r'\b-n\s+\w+|\b--namespace\s+\w+',  # Namespace flags
             r'\b-l\s+\w+|\b--selector\s+\w+',  # Label selectors
+            r'\b--field-selector\b',  # Field selectors
         ]
         
-        # Check for PromQL
-        promql_matches = sum(1 for pattern in promql_patterns if re.search(pattern, text_lower))
+        # First check for code blocks with language hints
+        code_blocks = re.findall(r'```(?:(promql|yaml|bash|sh|kubectl))?\n?(.*?)\n?```', text, re.DOTALL | re.IGNORECASE)
         
-        # Check for Kubernetes
+        if code_blocks:
+            for lang_hint, block in code_blocks:
+                block_clean = block.strip()
+                
+                # If explicitly tagged as promql
+                if lang_hint and lang_hint.lower() == 'promql':
+                    return "promql", block_clean
+                    
+                # If explicitly tagged as bash/kubectl
+                if lang_hint and lang_hint.lower() in ['bash', 'sh', 'kubectl']:
+                    return "kubernetes", block_clean
+                
+                # Analyze content if no explicit language tag
+                if not lang_hint and block_clean:
+                    # Check if it looks like a single-line metric query
+                    if any(re.search(pattern, block_clean, re.IGNORECASE) for pattern in promql_patterns):
+                        return "promql", block_clean
+                    elif any(re.search(pattern, block_clean, re.IGNORECASE) for pattern in k8s_patterns):
+                        return "kubernetes", block_clean
+        
+        # If no code blocks, analyze the entire text
+        # Count pattern matches
+        promql_matches = sum(1 for pattern in promql_patterns if re.search(pattern, text_lower))
         k8s_matches = sum(1 for pattern in k8s_patterns if re.search(pattern, text_lower))
         
-        # Extract potential scripts from code blocks
-        code_blocks = re.findall(r'```(?:promql|yaml|bash)?\n?(.*?)\n?```', text, re.DOTALL | re.IGNORECASE)
+        # Special checks for common cases
+        # Check for filesystem queries specifically
+        if 'filesystem' in text_lower and any(word in text_lower for word in ['avail', 'size', 'used', 'free']):
+            # Extract the potential PromQL query from the text
+            lines = text.strip().split('\n')
+            for line in lines:
+                if any(re.search(pattern, line, re.IGNORECASE) for pattern in promql_patterns):
+                    return "promql", line.strip()
         
-        # If we have code blocks, analyze them
-        if code_blocks:
-            for block in code_blocks:
-                block_lower = block.lower().strip()
-                block_promql_matches = sum(1 for pattern in promql_patterns if re.search(pattern, block_lower))
-                block_k8s_matches = sum(1 for pattern in k8s_patterns if re.search(pattern, block_lower))
-                
-                if block_promql_matches > block_k8s_matches:
-                    return "promql", block.strip()
-                elif block_k8s_matches > block_promql_matches:
-                    return "kubernetes", block.strip()
-        
-        # If no code blocks, check the entire text
+        # Make decision based on matches
         if promql_matches > k8s_matches and promql_matches > 0:
+            # Try to extract the metric query from text
+            lines = text.strip().split('\n')
+            for line in lines:
+                if any(re.search(pattern, line, re.IGNORECASE) for pattern in promql_patterns):
+                    return "promql", line.strip()
             return "promql", text.strip()
         elif k8s_matches > promql_matches and k8s_matches > 0:
+            # Try to extract kubectl command
+            lines = text.strip().split('\n')
+            for line in lines:
+                if 'kubectl' in line.lower():
+                    return "kubernetes", line.strip()
             return "kubernetes", text.strip()
         else:
             return "unknown", text.strip()
@@ -1434,14 +1139,23 @@ class ChatGPTService:
             ChatGPTService.request_count = max(0, ChatGPTService.request_count - 5)  # Decay mechanism
             return "I'm getting too many requests right now. Please try again in a few moments."
         
-        # Default system prompt if none provided
+        # Enhanced system prompt for better Korean and filesystem query handling
         if system_prompt is None:
             system_prompt = """You are a helpful assistant integrated with Mattermost. Keep responses concise and under 2000 characters.
-            
-When users ask about monitoring, metrics, or Prometheus, provide PromQL queries in code blocks.
-When users ask about Kubernetes, pods, services, deployments, or kubectl commands, provide the appropriate kubectl commands in code blocks.
-Always format your scripts in code blocks with the appropriate language tag (```promql or ```bash).
-"""
+
+When users ask about monitoring, metrics, or Prometheus (in any language including Korean):
+- Always provide PromQL queries in code blocks with ```promql
+- For filesystem questions (파일시스템, 디스크, 저장공간), use node_filesystem metrics
+- Example filesystem query: ```promql
+node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"} * 100
+```
+
+When users ask about Kubernetes, pods, services, deployments, or kubectl commands:
+- Provide kubectl commands in code blocks with ```bash
+- For Korean requests about pods (파드), nodes (노드), services (서비스), use appropriate kubectl commands
+
+Always format your scripts in properly tagged code blocks.
+Respond in Korean when the user writes in Korean."""
         
         # Implement retry with exponential backoff
         retry_delay = 1  # Starting delay in seconds
@@ -1496,73 +1210,74 @@ Always format your scripts in code blocks with the appropriate language tag (```
             except Exception as e:
                 logger.error(f"Unexpected error with ChatGPT: {str(e)}")
                 return "Sorry, an unexpected error occurred. Please try again with a simpler question."
-            
-    # Alternative approach: Client-side filtering when server-side doesn't work
-    async def _get_pods_with_client_side_filtering(self, command: str, format_type: str) -> str:
-        """Get pods with client-side filtering as fallback."""
-        namespace = "default"
-        label_selector = None
-        field_selector = None
-        all_namespaces = False
-        client_side_filter = None
+
+
+# Enhanced processing function for better script detection
+async def process_with_chatgpt_and_route(text: str, channel_id: str, user_name: str, response_url: str):
+    """Process request with ChatGPT and automatically route any generated scripts."""
+    try:
+        # Get response from ChatGPT
+        chatgpt_response = await chatgpt_service.get_response(text)
         
-        # Parse command as before...
-        if "--all-namespaces" in command:
-            all_namespaces = True
+        # Check if ChatGPT generated any executable scripts
+        script_type, extracted_script = script_discriminator.detect_script_type(chatgpt_response)
         
-        if "--field-selector=" in command:
-            parts = command.split("--field-selector=")
-            if len(parts) > 1:
-                field_selector = parts[1].split()[0]
-                
-                # Check if it's a != operator that might not work server-side
-                if "!=" in field_selector:
-                    client_side_filter = field_selector
-                    field_selector = None  # Don't pass to server
+        logger.info(f"ChatGPT response received. Detected script type: {script_type}, Script: {extracted_script}")
         
-        try:
-            # Get all pods first
-            if all_namespaces:
-                pods = self.v1.list_pod_for_all_namespaces(
-                    label_selector=label_selector,
-                    field_selector=field_selector
+        if script_type == "promql":
+            # Clean up the PromQL query - remove any trailing text
+            cleaned_script = extracted_script.split('\n')[0].strip()
+            if cleaned_script:
+                # Execute the PromQL query
+                prometheus_results = await prometheus_service.execute_query(cleaned_script, "table")
+                formatted_response = (
+                    f"@{user_name} asked: \"{text}\"\n\n"
+                    f"**ChatGPT's response:** {chatgpt_response}\n\n"
+                    f"**Detected PromQL query:** `{cleaned_script}`\n\n"
+                    f"**Execution results:**\n{prometheus_results}"
                 )
             else:
-                # Parse namespace...
-                pods = self.v1.list_namespaced_pod(
-                    namespace=namespace,
-                    label_selector=label_selector,
-                    field_selector=field_selector
+                # Fallback if script extraction failed
+                formatted_response = f"@{user_name} asked: \"{text}\"\n\n{chatgpt_response}"
+        elif script_type == "kubernetes":
+            # Execute the kubectl command
+            k8s_results = await kubernetes_service.execute_kubectl_command(extracted_script, "table")
+            formatted_response = (
+                f"@{user_name} asked: \"{text}\"\n\n"
+                f"**ChatGPT's response:** {chatgpt_response}\n\n"
+                f"**Detected kubectl command:** `{extracted_script}`\n\n"
+                f"**Execution results:**\n{k8s_results}"
+            )
+        else:
+            # No executable script detected, just return ChatGPT's response
+            formatted_response = f"@{user_name} asked: \"{text}\"\n\n{chatgpt_response}"
+        
+        # Send response back to Mattermost
+        if response_url:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    response_url,
+                    json={"text": formatted_response, "response_type": "in_channel"},
+                    timeout=10.0
                 )
+        else:
+            await mattermost_service.send_response(channel_id, formatted_response)
             
-            # Apply client-side filtering if needed
-            if client_side_filter:
-                filtered_pods = []
-                
-                if client_side_filter == "status.phase!=Running":
-                    filtered_pods = [pod for pod in pods.items if pod.status.phase != "Running"]
-                elif client_side_filter == "status.phase!=Succeeded":
-                    filtered_pods = [pod for pod in pods.items if pod.status.phase != "Succeeded"]
-                elif client_side_filter == "status.phase!=Failed":
-                    filtered_pods = [pod for pod in pods.items if pod.status.phase != "Failed"]
-                else:
-                    # Generic parsing for other != filters
-                    if "status.phase!=" in client_side_filter:
-                        exclude_status = client_side_filter.split("status.phase!=")[1]
-                        filtered_pods = [pod for pod in pods.items if pod.status.phase != exclude_status]
-                
-                # Create a new object with filtered items
-                pods.items = filtered_pods
-            
-            if format_type == "table":
-                return self._format_pods_as_table(pods)
-            elif format_type == "json":
-                return json.dumps([self._pod_to_dict(pod) for pod in pods.items], indent=2)
-            else:  # yaml format
-                return self._format_pods_as_yaml(pods)
-                
-        except ApiException as e:
-            return f"Error getting pods: {e.reason}"
+    except Exception as e:
+        logger.error(f"Error in ChatGPT routing: {str(e)}")
+        error_message = f"Sorry, I encountered an error: {str(e)}"
+        try:
+            if response_url:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        response_url,
+                        json={"text": error_message, "response_type": "ephemeral"},
+                        timeout=10.0
+                    )
+            else:
+                await mattermost_service.send_response(channel_id, f"@{user_name} {error_message}")
+        except Exception as inner_e:
+            logger.error(f"Failed to send error message: {str(inner_e)}")
     
 # Service for sending messages back to Mattermost
 class MattermostService:
@@ -1913,17 +1628,42 @@ async def process_prometheus_query(query: str, channel_id: str, user_name: str, 
         except Exception as inner_e:
             logger.error(f"Failed to send error message: {str(inner_e)}")
 
+
+# Configuration class for managing subprocess settings
+class SubprocessConfig:
+    @staticmethod
+    def enable_subprocess_execution():
+        """Enable subprocess execution - use with caution!"""
+        os.environ["ENABLE_KUBECTL_SUBPROCESS"] = "true"
+        logger.warning("Subprocess execution for kubectl has been ENABLED. This may pose security risks.")
+    
+    @staticmethod
+    def disable_subprocess_execution():
+        """Disable subprocess execution (default and recommended)"""
+        os.environ["ENABLE_KUBECTL_SUBPROCESS"] = "false"
+        logger.info("Subprocess execution for kubectl has been disabled.")
+    
+    @staticmethod
+    def set_kubectl_path(path: str):
+        """Set custom path to kubectl binary"""
+        os.environ["KUBECTL_PATH"] = path
+        logger.info(f"kubectl path set to: {path}")
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint with subprocess status."""
+    subprocess_enabled = os.getenv("ENABLE_KUBECTL_SUBPROCESS", "false").lower() == "true"
+    
     return {
         "status": "healthy",
         "services": {
             "prometheus": "configured" if PROMETHEUS_URL else "not configured",
             "kubernetes": "initialized" if kubernetes_service.v1 else "not initialized",
             "openai": "configured" if OPENAI_API_KEY else "not configured",
-            "mattermost": "configured" if MATTERMOST_URL and MATTERMOST_BOT_TOKEN else "not configured"
-        }
+            "mattermost": "configured" if MATTERMOST_URL and MATTERMOST_BOT_TOKEN else "not configured",
+            "kubectl_subprocess": "enabled" if subprocess_enabled else "disabled (recommended)"
+        },
+        "kubectl_path": os.getenv("KUBECTL_PATH", "kubectl")
     }
 
 if __name__ == "__main__":
