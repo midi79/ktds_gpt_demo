@@ -1,0 +1,215 @@
+# Kubernetes manifests for Prefect flows (works with existing Helm deployment)
+
+# ConfigMap to store your flow code
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prefect-flows-config
+  namespace: prefect  # Adjust if your Helm installation uses a different namespace
+data:
+  flows.py: |
+    # Your flows.py content will be mounted here
+    # This will be populated when you apply the flows
+---
+# ServiceAccount for flow execution jobs
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prefect-flow-runner
+  namespace: prefect
+
+---
+# Role for flow execution
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: prefect
+  name: prefect-flow-runner
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+
+---
+# RoleBinding for flow execution
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prefect-flow-runner
+  namespace: prefect
+subjects:
+- kind: ServiceAccount
+  name: prefect-flow-runner
+  namespace: prefect
+roleRef:
+  kind: Role
+  name: prefect-flow-runner
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Custom Docker image build job (optional - if you want to build a custom image with your flows)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-flow-image
+  namespace: prefect
+spec:
+  template:
+    spec:
+      serviceAccountName: prefect-flow-runner
+      containers:
+      - name: kaniko
+        image: gcr.io/kaniko-project/executor:latest
+        args:
+        - "--context=/workspace"
+        - "--dockerfile=/workspace/Dockerfile"
+        - "--destination=prefect-flows:latest"
+        - "--cache=true"
+        volumeMounts:
+        - name: dockerfile
+          mountPath: /workspace
+      volumes:
+      - name: dockerfile
+        configMap:
+          name: flow-dockerfile
+      restartPolicy: Never
+  backoffLimit: 3
+
+---
+# ConfigMap for Dockerfile (if building custom image)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flow-dockerfile
+  namespace: prefect
+data:
+  Dockerfile: |
+    FROM prefecthq/prefect:3-latest
+    
+    # Install additional dependencies if needed
+    RUN pip install --no-cache-dir pandas numpy requests
+    
+    # Copy flow files
+    COPY flows.py /opt/prefect/flows/
+    COPY deployment.py /opt/prefect/
+    
+    # Set working directory
+    WORKDIR /opt/prefect
+    
+    # Set default command
+    CMD ["python", "flows.py"]
+  
+  flows.py: |
+    # This will be replaced with your actual flows.py content
+    pass
+
+---
+# Example KubernetesJob template for flow execution
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubernetes-job-template
+  namespace: prefect
+data:
+  job-template.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: "{{ flow_run_name }}"
+      namespace: prefect
+      labels:
+        prefect.io/flow-run-id: "{{ flow_run_id }}"
+        prefect.io/flow-id: "{{ flow_id }}"
+        app: prefect-flow-run
+    spec:
+      ttlSecondsAfterFinished: 300
+      template:
+        metadata:
+          labels:
+            prefect.io/flow-run-id: "{{ flow_run_id }}"
+            app: prefect-flow-run
+        spec:
+          serviceAccountName: prefect-flow-runner
+          restartPolicy: Never
+          containers:
+          - name: flow-container
+            image: prefecthq/prefect:3-latest
+            command: ["python", "-c"]
+            args: 
+            - |
+              import subprocess
+              import sys
+              
+              # Install flow dependencies if needed
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "numpy", "requests"])
+              
+              # Download and execute the flow
+              from prefect import flow_run
+              flow_run.execute()
+            env:
+            - name: PREFECT_API_URL
+              value: "{{ prefect_api_url }}"
+            - name: PREFECT_FLOW_RUN_ID
+              value: "{{ flow_run_id }}"
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "100m"
+              limits:
+                memory: "1Gi"
+                cpu: "500m"
+          backoffLimit: 3
+
+---
+# Secret for additional configuration (optional)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prefect-flow-secrets
+  namespace: prefect
+type: Opaque
+data:
+  # Add any secrets your flows might need
+  # example: database-url: <base64-encoded-url>
+  # example: api-key: <base64-encoded-key>
+
+---
+# NetworkPolicy for flow execution (optional security)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prefect-flows-netpol
+  namespace: prefect
+spec:
+  podSelector:
+    matchLabels:
+      app: prefect-flow-run
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: prefect
+  egress:
+  - {} # Allow all egress (modify as needed for security)
+
+---
+# PodDisruptionBudget for flow runners
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: prefect-flows-pdb
+  namespace: prefect
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: prefect-flow-run
