@@ -12,3 +12,7 @@ helm install prometheus-stack prometheus-community/kube-prometheus-stack --names
 
 - Docker Desktop Kubernetes Metric 서버 활성화 하기 <br>
 https://data04190.tistory.com/133
+
+
+- Grafana init chown data 에러 발생시
+helm upgrade prometheus-stack prometheus-community/kube-prometheus-stack --reuse-values --set grafana.initChownData=false

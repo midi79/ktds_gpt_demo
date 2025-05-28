@@ -61,6 +61,7 @@ grafana:
   # Persist Grafana dashboards and settings (recommended for local K8s)
   persistence:
     enabled: true
+    type: emptyDir
     # type: pvc
     # storageClassName: default # Or your specific storage class
     # accessModes:

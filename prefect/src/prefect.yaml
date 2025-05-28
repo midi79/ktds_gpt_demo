@@ -1,0 +1,69 @@
+# prefect.yaml for Helm-based K8s deployment
+
+version: 1
+
+name: my-helm-k8s-project
+description: Project for deploying Prefect 3 flows to K8s via Helm.
+
+build: null # We are building and pushing the Docker image manually
+
+entrypoint: k8s_demo_flow.py:simple_k8s_flow_helm
+
+deployments:
+  - name: helm-k8s-release-run
+    description: "Runs the simple_k8s_flow_helm on K8s (Helm deployed Prefect)."
+    tags: ["kubernetes", "helm", "production-like"]
+    
+    work_pool_name: helm-k8s-job-pool # MUST match the K8s work pool name in your Prefect Server
+
+    parameters:
+      greeting: "Greetings from Prefect on Helm K8s"
+      
+    infrastructure:
+      type: kubernetes-job
+      namespace: prefect # IMPORTANT: Set to the K8s namespace where jobs should run.
+                         # This namespace must exist and the Prefect system
+                         # (via its service account) must have permission to create jobs here.
+                         # Check your Helm chart's configuration for recommended namespaces.
+
+      image: midi79/prefect-k8s-helm-flow:v0.1.0 # MUST be the full image path from your registry
+      # Example: image: yourusername/prefect-k8s-helm-flow:v0.1.0
+
+      image_pull_policy: IfNotPresent # Or 'Always' if you frequently update the 'latest' tag
+
+      # OPTIONAL: If using a private registry, and your K8s namespace/service account isn't already configured
+      # to use imagePullSecrets, you might need to specify them here.
+      # This usually involves creating a 'docker-registry' secret in K8s first.
+      # image_pull_secrets:
+      #   - name: my-registry-secret
+
+      # OPTIONAL: Specify a service account for the job if needed
+      # (Often configured at the Work Pool level, but can be overridden here)
+      # job_configuration:
+      #   job:
+      #     spec:
+      #       template:
+      #         spec:
+      #           serviceAccountName: prefect-job-runner-sa # Example service account name
+
+      # Optional: Environment variables for the Kubernetes job pod
+      # env:
+      #   POD_NAME:
+      #     valueFrom:
+      #       fieldRef:
+      #         fieldPath: metadata.name
+
+      # Optional: Kubernetes job specific configurations (resources, etc.)
+      # job:
+      #   spec:
+      #     template:
+      #       spec:
+      #         containers:
+      #           - name: prefect-job
+      #             resources:
+      #               requests:
+      #                 cpu: "100m"
+      #                 memory: "128Mi"
+      #               limits:
+      #                 cpu: "500m"
+      #                 memory: "256Mi"
