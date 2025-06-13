@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mattermost-chatgpt-bot
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mattermost-chatgpt-bot
+  template:
+    metadata:
+      labels:
+        app: mattermost-chatgpt-bot
+    spec:
+      serviceAccountName: mattermost-chatgpt-bot
+      containers:
+      - name: bot
+        image: your-registry/mattermost-chatgpt-bot:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: mattermost-chatgpt-secrets
+              key: openai-api-key
+        - name: MATTERMOST_URL
+          valueFrom:
+            configMapKeyRef:
+              name: mattermost-chatgpt-config
+              key: mattermost-url
+        - name: MATTERMOST_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: mattermost-chatgpt-secrets
+              key: mattermost-bot-token
+        - name: MATTERMOST_WEBHOOK_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: mattermost-chatgpt-secrets
+              key: mattermost-webhook-token
+        - name: PROMETHEUS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: mattermost-chatgpt-config
+              key: prometheus-url
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mattermost-chatgpt-bot
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mattermost-chatgpt-bot
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "namespaces", "nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mattermost-chatgpt-bot
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mattermost-chatgpt-bot
+subjects:
+- kind: ServiceAccount
+  name: mattermost-chatgpt-bot
+  namespace: default

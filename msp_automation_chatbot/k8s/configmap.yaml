@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mattermost-chatgpt-config
+  namespace: default
+data:
+  mattermost-url: "https://your-mattermost-instance.com"
+  prometheus-url: "http://prometheus:9090"
