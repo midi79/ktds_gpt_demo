@@ -54,7 +54,7 @@ async def find_abnormal_pods(k8s_service: KubernetesService) -> Tuple[str, Optio
     
     # Get pods that are not Running or Succeeded
     result = await k8s_service.execute_kubectl_command(
-        'kubectl get pods --all-namespaces --field-selector="status.phase!=Running,status.phase!=Succeeded"',
+        'kubectl get pods --all-namespaces --field-selector="status.phase!=Running',
         "table"
     )
     
