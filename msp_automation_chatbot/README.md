@@ -26,7 +26,7 @@ A FastAPI-based bot that integrates ChatGPT with Mattermost, providing natural l
 
 5. Run the deployment (In another terminal)
    ```bash
-   python -m python -m prefect_flows.deployment
+   python -m prefect_flows.deployment
 
 6. In the Mattermost
    ```bash

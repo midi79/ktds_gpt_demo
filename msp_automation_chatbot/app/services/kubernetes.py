@@ -280,7 +280,7 @@ class KubernetesService:
         if "--field-selector=" in command:
             parts = command.split("--field-selector=")
             if len(parts) > 1:
-                field_selector_value = parts[1].split()[0]
+                field_selector_value = parts[1].split()[0].strip('\'"') # FIX: Strip quotes
                 
                 if "!=" in field_selector_value and "status.phase" in field_selector_value:
                     client_side_filter = field_selector_value
@@ -432,49 +432,70 @@ class KubernetesService:
             return f"Error getting nodes: {e.reason}"
     
     async def _describe_pod(self, command: str, format_type: str) -> str:
-        """Describe a specific pod."""
+        """Describe a specific pod with corrected parsing."""
         parts = command.split()
         pod_name = None
         namespace = "default"
-        
-        skip_next = False
+
+        # Correctly parse pod_name and namespace regardless of order
+        # Find pod name (first argument after 'pod' that is not a flag)
+        pod_keyword_index = -1
+        if 'pod' in parts:
+            pod_keyword_index = parts.index('pod')
+        elif 'pods' in parts:
+            pod_keyword_index = parts.index('pods')
+
+        if pod_keyword_index != -1 and pod_keyword_index + 1 < len(parts):
+            if not parts[pod_keyword_index + 1].startswith('-'):
+                pod_name = parts[pod_keyword_index + 1]
+
+        # Find namespace
         for i, part in enumerate(parts):
-            if skip_next:
-                skip_next = False
-                continue
-                
             if part in ["-n", "--namespace"] and i + 1 < len(parts):
                 namespace = parts[i + 1]
-                skip_next = True
-            elif not part.startswith("-") and part not in ["kubectl", "describe", "pod"]:
-                pod_name = part
                 break
         
         if not pod_name:
-            return "Error: Pod name is required for describe command"
-        
+            return "Error: Pod name not found in describe command."
+
         try:
-            pod = self.v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+            pod_obj = self.v1.read_namespaced_pod(name=pod_name, namespace=namespace)
             
-            description = f"### Pod Description: {pod_name}\n\n"
-            description += f"**Namespace:** {pod.metadata.namespace}\n"
-            description += f"**Status:** {pod.status.phase}\n"
-            description += f"**Node:** {pod.spec.node_name or 'Not assigned'}\n"
-            description += f"**Created:** {pod.metadata.creation_timestamp}\n"
-            
-            if pod.spec.containers:
-                description += f"\n**Containers:**\n"
-                for container in pod.spec.containers:
-                    description += f"- **{container.name}**: {container.image}\n"
-            
-            return description
-            
+            # Fetch recent events for the pod, which is crucial for debugging
+            events_str = "No events found."
+            try:
+                events = self.v1.list_namespaced_event(
+                    namespace=namespace,
+                    field_selector=f"involvedObject.name={pod_name}"
+                )
+                if events.items:
+                    event_list = [
+                        f"- **Type**: {e.type}, **Reason**: {e.reason}, **Message**: {e.message}"
+                        for e in sorted(events.items, key=lambda e: e.last_timestamp, reverse=True)[:10] # Get last 10 events
+                    ]
+                    events_str = "\n".join(event_list)
+            except ApiException as e:
+                logger.warning(f"Could not fetch events for pod {pod_name}: {e.reason}")
+                events_str = "Could not fetch events."
+
+
+            # Return a summary similar to `kubectl describe`
+            return (
+                f"### Pod Description: {pod_name}\n\n"
+                f"**Namespace:** `{pod_obj.metadata.namespace}`\n"
+                f"**Status:** `{pod_obj.status.phase}`\n"
+                f"**Node:** `{pod_obj.spec.node_name or 'Not assigned'}`\n"
+                f"**Created:** `{pod_obj.metadata.creation_timestamp}`\n\n"
+                f"#### Recent Events\n{events_str}"
+            )
+
         except ApiException as e:
             if e.status == 404:
-                return f"Pod '{pod_name}' not found in namespace '{namespace}'"
+                return f"Error: Pod '{pod_name}' not found in namespace '{namespace}'"
             else:
+                logger.error(f"API Error describing pod: {e.reason}")
                 return f"Error describing pod: {e.reason}"
-    
+
     async def _get_logs(self, command: str, format_type: str) -> str:
         """Get pod logs."""
         parts = command.split()
@@ -488,9 +509,14 @@ class KubernetesService:
             elif part.startswith("--tail="):
                 lines = int(part.split("=")[1])
             elif part not in ["kubectl", "logs", "-n", "--namespace"] and not part.startswith("--"):
-                pod_name = part
-                break
-        
+                if (i > 0 and parts[i-1] not in ["-n", "--namespace"]):
+                     pod_name = part
+
+        if not pod_name:
+             # Fallback if parsing fails
+            if parts and not parts[-1].startswith('-'):
+                 pod_name = parts[-1]
+
         if not pod_name:
             return "Error: Pod name is required for logs command"
         

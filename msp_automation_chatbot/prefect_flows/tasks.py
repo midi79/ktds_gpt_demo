@@ -49,42 +49,81 @@ async def get_all_pods(k8s_service: KubernetesService) -> str:
     description="Identify pods not in Running or Succeeded state"
 )
 async def find_abnormal_pods(k8s_service: KubernetesService) -> Tuple[str, Optional[Dict[str, str]]]:
-    """Find pods that are not in Running or Succeeded state."""
-    logger.info("Finding abnormal pods")
-    
-    # Get pods that are not Running or Succeeded
-    result = await k8s_service.execute_kubectl_command(
-        'kubectl get pods --all-namespaces --field-selector="status.phase!=Running"',
+    """Finds pods that are not in a 'Running' or 'Succeeded' state."""
+    logger.info("Finding abnormal pods by fetching all and filtering.")
+
+    # Get all pods and filter them client-side for reliability.
+    all_pods_table = await k8s_service.execute_kubectl_command(
+        'kubectl get pods --all-namespaces',
         "table"
     )
+
+    lines = all_pods_table.split('\n')
+    abnormal_pod_info = None
+    abnormal_pods_found = []
+
+    # Find the header to correctly map columns
+    header_line = ""
+    separator_line_index = -1
+    for i, line in enumerate(lines):
+        if "---" in line and "|" in line:
+            header_line = lines[i-1]
+            separator_line_index = i
+            break
     
-    # Parse the result to find the first abnormal pod
-    lines = result.split('\n')
-    abnormal_pod = None
-    
-    for line in lines:
-        if '|' in line and 'NAMESPACE' not in line and '---' not in line:
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) >= 4:
-                # Extract namespace, pod name, and status
-                pod_name = parts[0]
-                namespace = parts[1]
-                status = parts[2]
-                
-                # Skip empty lines or header remnants
-                if pod_name and namespace and status and status not in ['Running', 'Succeeded', 'STATUS', 'Name']:
-                    abnormal_pod = {
-                        'namespace': namespace,
-                        'name': pod_name,
-                        'status': status
-                    }
-                    logger.info(f"Found abnormal pod: {pod_name} in namespace {namespace} with status {status}")
-                    break
-    
-    if not abnormal_pod:
-        logger.info("No abnormal pods found")
-    
-    return result, abnormal_pod
+    if not header_line:
+         return "Could not parse pod list.", None
+
+    headers = [h.strip().lower() for h in header_line.split('|') if h.strip()]
+    try:
+        name_idx = headers.index('name')
+        namespace_idx = headers.index('namespace')
+        status_idx = headers.index('status')
+    except ValueError:
+        return "Could not find expected columns (name, namespace, status) in pod list.", None
+
+    # Account for the leading empty string from split('|')
+    name_idx += 1
+    namespace_idx += 1
+    status_idx += 1
+
+    for line in lines[separator_line_index + 1:]:
+        if '|' not in line:
+            continue
+
+        parts = line.split('|')
+        if len(parts) < max(name_idx, namespace_idx, status_idx) + 1:
+            continue
+
+        name = parts[name_idx].strip()
+        namespace = parts[namespace_idx].strip()
+        status_raw = parts[status_idx].strip()
+        status = status_raw.replace('*', '') # Remove markdown bold characters
+
+        if name and status and status not in ['Running', 'Succeeded', 'Completed']:
+            abnormal_pods_found.append(line)
+            if abnormal_pod_info is None:  # Capture the first abnormal pod for deep-dive
+                abnormal_pod_info = {
+                    'namespace': namespace,
+                    'name': name,
+                    'status': status
+                }
+                logger.info(f"Found abnormal pod: {name} in namespace {namespace} with status {status}")
+
+    if not abnormal_pods_found:
+        abnormal_pods_result = "✅ Good news! No abnormal pods found. All pods are either Running or Succeeded."
+        logger.info("No abnormal pods found.")
+    else:
+        # Reconstruct the table with only the abnormal pods for the response
+        abnormal_pods_result = "\n".join([header_line, lines[separator_line_index]] + abnormal_pods_found)
+        # Find and append the original summary if it exists
+        summary = [line for line in lines if line.strip().startswith('**Summary:')]
+        if summary:
+             abnormal_pods_result += "\n\n" + summary[0]
+
+
+    return abnormal_pods_result, abnormal_pod_info
+
 
 @task(
     name="Describe Abnormal Pod",
