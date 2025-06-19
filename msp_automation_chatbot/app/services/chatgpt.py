@@ -60,7 +60,7 @@ Respond in Korean when the user writes in Korean."""
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": message}
                             ],
-                            "temperature": 0.7,
+                            "temperature": 0.1,
                             "max_tokens": 1000,
                             "top_p": 1,
                             "frequency_penalty": 0,
